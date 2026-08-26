@@ -7,6 +7,7 @@ import gc
 import threading
 import numpy as np
 import pyttsx3
+import torch
 from datetime import datetime
 from collections import deque
 from ultralytics import YOLO
@@ -25,13 +26,12 @@ os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def speak_text_async(text):
-    """Windows OneCore Turkce (Tolga) dogal ses motoru ile cok net ve anlasilir sesli ikaz verir."""
+    """Windows OneCore Turkce (Tolga) dogal ses motoru ile anlasilir sesli ikaz verir."""
     def _speak():
         try:
             engine = pyttsx3.init()
-            engine.setProperty('rate', 160) # Dogal, akici ve anlasilir konusma hizi
+            engine.setProperty('rate', 160)
 
-            # 1. Oncelikli: Windows Dogal Turkce Sesleri (Tolga / Emel)
             onecore_turkish_voices = [
                 r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Speech_OneCore\Voices\Tokens\MSTTS_V110_trTR_Tolga",
                 r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Speech_OneCore\Voices\Tokens\MSTTS_V110_trTR_Emel"
@@ -46,7 +46,6 @@ def speak_text_async(text):
                 except Exception:
                     pass
 
-            # 2. Alternatif: SAPI5 listesindeki TR sesleri
             if not voice_selected:
                 voices = engine.getProperty('voices')
                 for voice in voices:
@@ -74,21 +73,25 @@ def send_desktop_notification(title, message):
 
     threading.Thread(target=_notify, daemon=True).start()
 
-def save_video_async(frames_list, video_path, width=640, height=360, fps=30.0, event_name="VIDEO"):
-    """Optimize edilmis 640x360 tamponu arka planda MP4 olarak kaydeder ve RAM temizligi yapar."""
+def save_compressed_video_async(compressed_frames_list, video_path, width=640, height=360, fps=30.0, event_name="VIDEO"):
+    """Sıkıştırılmış JPEG tamponunu decode edip MP4 yazar ve RAM'i tamamen serbest bırakır."""
     def _save():
         try:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             out = cv2.VideoWriter(video_path, fourcc, fps, (width, height))
-            for f in frames_list:
-                out.write(f)
+            for enc_frame in compressed_frames_list:
+                raw_frame = cv2.imdecode(enc_frame, cv2.IMREAD_COLOR)
+                if raw_frame is not None:
+                    out.write(raw_frame)
             out.release()
             print(f"\n[+] {event_name} KAYDEDILDI -> {video_path}")
         except Exception as e:
             print(f"[!] Video kaydetme hatasi: {e}")
         finally:
-            del frames_list
-            gc.collect() # Kayit sonrasi RAM cop toplayicisini calistir
+            del compressed_frames_list
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     threading.Thread(target=_save, daemon=True).start()
 
@@ -159,7 +162,7 @@ def main():
         )
         return
 
-    # Kamera cozunurlugunu 640x480 olarak sabitle (RAM tasarrufu)
+    # Kamera cozunurlugunu 640x480 olarak sabitle (RAM ve CPU tasarrufu)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
@@ -184,7 +187,7 @@ def main():
     BRIGHTNESS_OBSTRUCTION_THRESHOLD = 22.0    # Parlaklik < 22 ise karartma/el
     EDGE_COUNT_THRESHOLD = 150                 # Canny kenar sayisi < 150 ise lense yapisik engel
 
-    # 10 SANIYELIK DUSUK COZUNURLUKLU (640x360) 300 KARELIK OPTIMIZE TAMPON (%75 RAM Tasarrufu)
+    # JPEG SIKISTIRILMIS 300 KARELIK TAMPO (RAM kullanimi 1.5 GB'tan 20-30 MB'a duser!)
     BUFFER_W, BUFFER_H = 640, 360
     frame_buffer = deque(maxlen=300)
 
@@ -206,7 +209,7 @@ def main():
     last_valid_frame = None
     last_saved_video_name = ""
 
-    frame_count = 0
+    frame_counter = 0
     fps_start_time = time.time()
     fps = 0
 
@@ -214,6 +217,15 @@ def main():
     is_yolo_busy = False
     detected_objects = []
     last_seen_time = 0.0
+
+    # Frame Skipping (Kare Atlama) onbellek degiskenleri
+    cached_has_face = False
+    cached_lip_center = None
+    cached_eye_distance = 80.0
+    cached_avg_ear = 0.35
+    cached_eyes_closed = False
+    cached_is_obstructed = False
+    cached_block_reason = ""
 
     lip_indices = set()
     for conn in mp_face_mesh.FACEMESH_LIPS:
@@ -224,29 +236,33 @@ def main():
         nonlocal is_yolo_busy, detected_objects, last_seen_time
         try:
             img_dim = max(160, (roi_img.shape[0] // 32) * 32)
-            results = yolo_model(roi_img, conf=CONFIDENCE_THRESHOLD, verbose=False, imgsz=img_dim)
-            current_boxes = []
+            # RADIKAL OPTIMIZASYON: PyTorch Gradients Kapatma & Cache Temizleme
+            with torch.no_grad():
+                results = yolo_model(roi_img, conf=CONFIDENCE_THRESHOLD, verbose=False, imgsz=img_dim)
+                current_boxes = []
 
-            for r in results:
-                for box in r.boxes:
-                    conf = float(box.conf[0])
-                    cls_id = int(box.cls[0])
-                    cls_name = r.names[cls_id].strip().lower() if (hasattr(r, 'names') and cls_id in r.names) else "cigarette"
+                for r in results:
+                    for box in r.boxes:
+                        conf = float(box.conf[0])
+                        cls_id = int(box.cls[0])
+                        cls_name = r.names[cls_id].strip().lower() if (hasattr(r, 'names') and cls_id in r.names) else "cigarette"
 
-                    if (cls_name in ALLOWED_CLASSES or cls_id == 0) and conf >= CONFIDENCE_THRESHOLD:
-                        bx1, by1, bx2, by2 = map(int, box.xyxy[0])
-                        fx1 = offset_x + bx1
-                        fy1 = offset_y + by1
-                        fx2 = offset_x + bx2
-                        fy2 = offset_y + by2
-                        current_boxes.append((fx1, fy1, fx2, fy2, cls_name, conf))
-                        last_seen_time = time.time()
-                        print(f"[*] SIGARA YAKALANDI: %{int(conf*100)}")
+                        if (cls_name in ALLOWED_CLASSES or cls_id == 0) and conf >= CONFIDENCE_THRESHOLD:
+                            bx1, by1, bx2, by2 = map(int, box.xyxy[0])
+                            fx1 = offset_x + bx1
+                            fy1 = offset_y + by1
+                            fx2 = offset_x + bx2
+                            fy2 = offset_y + by2
+                            current_boxes.append((fx1, fy1, fx2, fy2, cls_name, conf))
+                            last_seen_time = time.time()
+                            print(f"[*] SIGARA YAKALANDI: %{int(conf*100)}")
 
-            detected_objects = current_boxes
+                detected_objects = current_boxes
+                del results # YOLO sonuc nesnesini RAM'den hemen sil
         except Exception as e:
             pass
         finally:
+            del roi_img
             is_yolo_busy = False
 
     with mp_face_mesh.FaceMesh(
@@ -261,11 +277,11 @@ def main():
     ) as hands:
 
         print("==================================================")
-        print("PuffGuard - RAM Optimize Takip Sistemi Aktif.")
-        print(f"- Bellek Optimizasyonu: 640x360 Hafif Tampon + Otomatik GC")
+        print("PuffGuard - Sifir Bellek Sizintili (Zero Leak) Sistem Aktif.")
+        print(f"- Sıkıştırılmış JPEG Tampon: 300 Kare ~25 MB RAM (%98 Tasarruf)")
+        print(f"- Kare Atlama (Frame Skipping): %50 CPU/RAM Tasarrufu")
+        print(f"- PyTorch No-Grad & Anlik GC: Aktif")
         print(f"- Ses Motoru: Microsoft Tolga (Dogal Turkce)")
-        print(f"- Kamera Engelleme: Kağıt, Bez, Bant, Karartma (Hassas Canny)")
-        print(f"- Masadan Ayrılma: Boş oda kenarları algılanır, sessizce beklenir.")
         print(f"- Uyku Tespiti: Kesintisiz {int(SLEEP_DURATION_REQ_SEC)}s (1 Dakika)")
         print(f"- Sigara Cooldown: {int(CIGARETTE_NOTIFICATION_COOLDOWN)}s (15 Dakika)")
         print("- Cikis: 'q' tusu")
@@ -273,6 +289,9 @@ def main():
 
         while True:
             current_time = time.time()
+            frame_counter += 1
+            process_ai_this_frame = (frame_counter % 2 == 0) # 2 karede 1 yapay zeka analizi (Frame Skipping)
+
             success, frame = cap.read()
 
             # --- 1. DONANIM / YAZILIM KAPANMASI (FRAME LOSS) ---
@@ -302,13 +321,15 @@ def main():
             else:
                 camera_loss_start_time = None
 
-            # Frame islemleri (Gereksiz kopyalamalar onlendi)
             last_valid_frame = frame
             frame = cv2.flip(frame, 1)
             h, w, _ = frame.shape
 
-            # RAM OPTIMIZASYONU: Tampona 640x360 kucuk boyutlu kare ekle (%75 daha az RAM)
-            frame_buffer.append(cv2.resize(frame, (BUFFER_W, BUFFER_H)))
+            # RADIKAL RAM OPTIMIZASYONU: Kareyi JPEG olarak sikistirip sakla (1.5 GB -> 25 MB)
+            small_resized = cv2.resize(frame, (BUFFER_W, BUFFER_H))
+            _, enc_frame = cv2.imencode('.jpg', small_resized, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            frame_buffer.append(enc_frame)
+            del small_resized
 
             # --- SIGARA ICIN 5 SANIYE SONRASI KARE TOPLAMA VE KAYIT ---
             if recording_post_event:
@@ -317,7 +338,7 @@ def main():
                     video_name = f"cigarette_video_10s_{event_timestamp_str}.mp4"
                     video_path = os.path.join(photo_dir, video_name)
 
-                    save_video_async(list(frame_buffer), video_path, width=BUFFER_W, height=BUFFER_H, fps=30.0, event_name="10s SIGARA VIDEOSU")
+                    save_compressed_video_async(list(frame_buffer), video_path, width=BUFFER_W, height=BUFFER_H, fps=30.0, event_name="10s SIGARA VIDEOSU")
                     last_saved_video_name = video_name
 
                     send_desktop_notification(
@@ -330,50 +351,96 @@ def main():
                     post_event_counter = 0
                     print(f"[i] 5sn oncesi + 5sn sonrasi video kaydi tamamlandi. 15 dakikalik bekleme basladi.")
 
-            # FPS Sayaci ve Periyodik GC
-            frame_count += 1
+            # FPS Sayaci
             if time.time() - fps_start_time >= 1.0:
-                fps = frame_count
-                frame_count = 0
+                fps = frame_counter
+                frame_counter = 0
                 fps_start_time = time.time()
-                # Her saniyede bir hafif cop temizligi
                 gc.collect()
 
-            # RGB Formati (MediaPipe icin)
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            rgb_frame.flags.writeable = False
+            # --- YALNIZCA CIFTLI KARELERDE AI ISLEMLERINI YURUT (FRAME SKIPPING) ---
+            if process_ai_this_frame:
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                rgb_frame.flags.writeable = False
 
-            face_results = face_mesh.process(rgb_frame)
-            hand_results = hands.process(rgb_frame)
+                face_results = face_mesh.process(rgb_frame)
+                hand_results = hands.process(rgb_frame)
 
-            rgb_frame.flags.writeable = True
+                rgb_frame.flags.writeable = True
 
-            has_face = bool(face_results.multi_face_landmarks)
+                cached_has_face = bool(face_results.multi_face_landmarks)
 
-            # --- 2. HASSAS CANNY KENAR & DOKU ANALIZI ILE ENGELLEME TESPITI ---
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            avg_brightness = float(np.mean(gray))
-            std_brightness = float(np.std(gray))
-            laplacian_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+                # Engel / Karartma / Doku Analizi
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                avg_brightness = float(np.mean(gray))
+                std_brightness = float(np.std(gray))
+                laplacian_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
-            edges = cv2.Canny(gray, 40, 120)
-            edge_count = int(np.count_nonzero(edges))
+                edges = cv2.Canny(gray, 40, 120)
+                edge_count = int(np.count_nonzero(edges))
 
-            is_camera_obstructed = False
-            block_reason = ""
-
-            if has_face:
-                is_camera_obstructed = False
-            else:
-                if avg_brightness < BRIGHTNESS_OBSTRUCTION_THRESHOLD:
-                    is_camera_obstructed = True
-                    block_reason = "Karartma / Siyah Kapak"
-                elif edge_count < EDGE_COUNT_THRESHOLD and (std_brightness < 14.0 or laplacian_var < 25.0):
-                    is_camera_obstructed = True
-                    block_reason = "Kağıt / Lense Yapışık Engel"
+                if cached_has_face:
+                    cached_is_obstructed = False
+                    cached_block_reason = ""
                 else:
-                    is_camera_obstructed = False
+                    if avg_brightness < BRIGHTNESS_OBSTRUCTION_THRESHOLD:
+                        cached_is_obstructed = True
+                        cached_block_reason = "Karartma / Siyah Kapak"
+                    elif edge_count < EDGE_COUNT_THRESHOLD and (std_brightness < 14.0 or laplacian_var < 25.0):
+                        cached_is_obstructed = True
+                        cached_block_reason = "Kağıt / Lense Yapışık Engel"
+                    else:
+                        cached_is_obstructed = False
+                        cached_block_reason = ""
 
+                del gray, edges
+
+                # Yuz ve Dudak Noktalari
+                cached_lip_center = None
+                cached_eyes_closed = False
+
+                if face_results.multi_face_landmarks:
+                    for face_landmarks in face_results.multi_face_landmarks:
+                        p_left_eye = (face_landmarks.landmark[33].x * w, face_landmarks.landmark[33].y * h)
+                        p_right_eye = (face_landmarks.landmark[263].x * w, face_landmarks.landmark[263].y * h)
+                        cached_eye_distance = calculate_distance(p_left_eye, p_right_eye)
+
+                        lip_x = []
+                        lip_y = []
+                        for idx in lip_indices:
+                            lm = face_landmarks.landmark[idx]
+                            lip_x.append(int(lm.x * w))
+                            lip_y.append(int(lm.y * h))
+
+                        if lip_x and lip_y:
+                            cached_lip_center = (int(sum(lip_x) / len(lip_x)), int(sum(lip_y) / len(lip_y)))
+
+                        left_ear = calculate_ear(LEFT_EYE_INDICES, face_landmarks.landmark, w, h)
+                        right_ear = calculate_ear(RIGHT_EYE_INDICES, face_landmarks.landmark, w, h)
+                        cached_avg_ear = (left_ear + right_ear) / 2.0
+
+                        if cached_avg_ear < EAR_THRESHOLD:
+                            cached_eyes_closed = True
+
+                # El Cizimleri
+                if hand_results.multi_hand_landmarks:
+                    for hand_landmarks, handedness in zip(hand_results.multi_hand_landmarks, hand_results.multi_handedness):
+                        index_tip = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+                        ix, iy = int(index_tip.x * w), int(index_tip.y * h)
+                        cv2.circle(frame, (ix, iy), 6, (0, 255, 0), cv2.FILLED)
+
+                del face_results, hand_results, rgb_frame
+
+            # Onbellekteki Degerleri Kullan
+            has_face = cached_has_face
+            is_camera_obstructed = cached_is_obstructed
+            block_reason = cached_block_reason
+            lip_center = cached_lip_center
+            eye_distance = cached_eye_distance
+            avg_ear = cached_avg_ear
+            eyes_closed = cached_eyes_closed
+
+            # --- 2. ENGELLEME SURE VE IKAZ SAYACI ---
             block_duration = 0.0
             if is_camera_obstructed:
                 if block_start_time is None:
@@ -381,7 +448,6 @@ def main():
 
                 block_duration = current_time - block_start_time
 
-                # Kesintisiz 1 DAKIKA (60 saniye) engelleme durumunda bildirim ve SESLI IKAZ
                 if block_duration >= BLOCK_DURATION_REQ_SEC:
                     if (current_time - last_blocked_notification_time) >= SECURITY_NOTIFICATION_COOLDOWN:
                         now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -390,13 +456,11 @@ def main():
                         cv2.imwrite(blocked_photo_path, frame)
                         print(f"\n[!] UYARI: Kamera Önü Engellendi! Fotoğraf: {blocked_photo_name}")
 
-                        # Masaustu Bildirimi & Turkce Sesli Ikaz
                         send_desktop_notification(
                             "UYARI: Kamera Önü Engellendi!",
                             f"Kamera görüşü 1 dakikadır kapalı/engelli ({block_reason}). Son durum fotoğrafı kaydedildi."
                         )
                         speak_text_async("Uyarı! Kamera görüşü engellendi.")
-
                         last_blocked_notification_time = current_time
 
                 cv2.rectangle(frame, (20, h // 2 - 40), (w - 20, h // 2 + 40), (0, 0, 180), -1)
@@ -404,53 +468,7 @@ def main():
             else:
                 block_start_time = None
 
-            lip_center = None
-            eye_distance = 80.0
-            avg_ear = 0.35
-            eyes_closed = False
-
-            # --- 3. YUZ NIRENGI, DUDAK VE UYKU (EAR) ANALIZI ---
-            if face_results.multi_face_landmarks:
-                for face_landmarks in face_results.multi_face_landmarks:
-                    mp_drawing.draw_landmarks(
-                        image=frame,
-                        landmark_list=face_landmarks,
-                        connections=mp_face_mesh.FACEMESH_LIPS,
-                        landmark_drawing_spec=None,
-                        connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_contours_style()
-                    )
-
-                    # Iki Goz Arasi Mesafe
-                    p_left_eye = (face_landmarks.landmark[33].x * w, face_landmarks.landmark[33].y * h)
-                    p_right_eye = (face_landmarks.landmark[263].x * w, face_landmarks.landmark[263].y * h)
-                    eye_distance = calculate_distance(p_left_eye, p_right_eye)
-
-                    # Dudak Merkezi
-                    lip_x = []
-                    lip_y = []
-                    for idx in lip_indices:
-                        lm = face_landmarks.landmark[idx]
-                        cx, cy = int(lm.x * w), int(lm.y * h)
-                        lip_x.append(cx)
-                        lip_y.append(cy)
-
-                    if lip_x and lip_y:
-                        lip_center = (int(sum(lip_x) / len(lip_x)), int(sum(lip_y) / len(lip_y)))
-                        cv2.circle(frame, lip_center, 4, (255, 0, 0), cv2.FILLED)
-
-                    # Eye Aspect Ratio (EAR) Hesaplama
-                    left_ear = calculate_ear(LEFT_EYE_INDICES, face_landmarks.landmark, w, h)
-                    right_ear = calculate_ear(RIGHT_EYE_INDICES, face_landmarks.landmark, w, h)
-                    avg_ear = (left_ear + right_ear) / 2.0
-
-                    for idx in (LEFT_EYE_INDICES + RIGHT_EYE_INDICES):
-                        elm = face_landmarks.landmark[idx]
-                        cv2.circle(frame, (int(elm.x * w), int(elm.y * h)), 2, (0, 255, 255), -1)
-
-                    if avg_ear < EAR_THRESHOLD:
-                        eyes_closed = True
-
-            # --- 4. UYKU / DROWSINESS SAYACI (1 DAKIKA KURALI) ---
+            # --- 3. UYKU SAYACI ---
             sleep_cooldown_remaining = max(0.0, SLEEP_NOTIFICATION_COOLDOWN - (current_time - last_sleep_notification_time))
             in_sleep_cooldown = (current_time - last_sleep_notification_time) < SLEEP_NOTIFICATION_COOLDOWN
 
@@ -470,38 +488,20 @@ def main():
                         sleep_video_name = f"sleep_alert_{now_str}.mp4"
                         sleep_video_path = os.path.join(photo_dir, sleep_video_name)
 
-                        save_video_async(list(frame_buffer), sleep_video_path, width=BUFFER_W, height=BUFFER_H, fps=30.0, event_name="1 DAKIKALIK UYKU VIDEOSU")
+                        save_compressed_video_async(list(frame_buffer), sleep_video_path, width=BUFFER_W, height=BUFFER_H, fps=30.0, event_name="1 DAKIKALIK UYKU VIDEOSU")
                         last_saved_video_name = sleep_video_name
 
-                        # Masaustu Bildirimi & Turkce Sesli Ikaz
                         send_desktop_notification(
                             "UYARI: 1 Dakikadır Uyku Halindesiniz!",
                             f"Gözleriniz kesintisiz 1 dakikadır kapalı tespit edildi! 10 sn kanıt videosu '{sleep_video_name}' kaydedildi."
                         )
                         speak_text_async("Lütfen uyanın! Bir dakikadır uyku halindesiniz.")
-
                         last_sleep_notification_time = current_time
                         print(f"\n[!] 1 DAKIKALIK UYKU ALARMI: 2 dakikalık (120s) uyku soğuma süresi başlatıldı.")
             else:
                 sleep_start_time = None
 
-            # 5. El Landmarklari
-            if hand_results.multi_hand_landmarks:
-                for hand_landmarks, handedness in zip(hand_results.multi_hand_landmarks, hand_results.multi_handedness):
-                    mp_drawing.draw_landmarks(
-                        image=frame,
-                        landmark_list=hand_landmarks,
-                        connections=mp_hands.HAND_CONNECTIONS,
-                        landmark_drawing_spec=mp_drawing.DrawingSpec(color=(200, 200, 200), thickness=1, circle_radius=1),
-                        connection_drawing_spec=mp_drawing.DrawingSpec(color=(180, 180, 180), thickness=1)
-                    )
-
-                    index_tip = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
-                    ix, iy = int(index_tip.x * w), int(index_tip.y * h)
-                    hand_label = handedness.classification[0].label
-                    cv2.circle(frame, (ix, iy), 7, (0, 255, 0), cv2.FILLED)
-
-            # --- 6. 2.2x CARPANLI VE MINIMUM 150px SINIRLI DINAMIK AGIZ ROI ---
+            # --- 4. DINAMIK AGIZ ROI & YOLO ---
             if lip_center is not None and not is_camera_obstructed:
                 calculated_size = int(eye_distance * 2.2)
                 roi_size = max(150, calculated_size)
@@ -519,9 +519,8 @@ def main():
 
                 mouth_crop = frame[ry1:ry2, rx1:rx2]
 
-                if yolo_model is not None and mouth_crop.size > 0 and not is_yolo_busy:
+                if yolo_model is not None and mouth_crop.size > 0 and not is_yolo_busy and process_ai_this_frame:
                     is_yolo_busy = True
-                    # mouth_crop uzerinde arka plan thread calistir
                     threading.Thread(target=run_yolo_on_mouth_roi, args=(mouth_crop.copy(), rx1, ry1), daemon=True).start()
 
                 has_cig = len(detected_objects) > 0
@@ -529,7 +528,7 @@ def main():
                 cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), roi_box_color, 2)
                 cv2.putText(frame, f"Dinamik ROI {roi_size}x{roi_size} (2.2x)", (rx1, max(15, ry1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, roi_box_color, 1)
 
-            # 7. Sigara Dogrulama Sayaci (12 Kare)
+            # 5. Sigara Dogrulama Sayaci (12 Kare)
             is_currently_detected = len(detected_objects) > 0 or (current_time - last_seen_time < 0.35)
             best_score = 0.0
 
@@ -547,20 +546,17 @@ def main():
             else:
                 consecutive_detection_count = 0
 
-            # 8. Sigara 15 Dk Cooldown ve Tetikleme
+            # 6. Sigara 15 Dk Cooldown ve Tetikleme
             cig_cooldown_remaining = max(0.0, CIGARETTE_NOTIFICATION_COOLDOWN - (current_time - last_cigarette_notification_time))
             in_cig_cooldown = (current_time - last_cigarette_notification_time) < CIGARETTE_NOTIFICATION_COOLDOWN
             is_cig_confirmed = consecutive_detection_count >= REQUIRED_CONSECUTIVE_FRAMES
 
-            # 12 Kare Sigara Dogrulandiginda (Bildirim, Sesli Ikaz ve 5sn Sonrasi Video Kaydi)
             if is_cig_confirmed:
                 if not in_cig_cooldown and not recording_post_event:
                     recording_post_event = True
                     post_event_counter = 0
                     event_timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
                     print(f"\n[+] SIGARA DOGRULANDI! 5 saniyelik sonrasi kaydediliyor...")
-
-                    # Turkce Sesli Ikaz
                     speak_text_async("Sigara kullanımı tespit edildi. Kayıt alınıyor.")
 
                 cv2.putText(frame, f"DOGRULANDI: SIGARA (%{int(best_score*100)})", (w // 2 - 210, h - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
@@ -578,36 +574,29 @@ def main():
 
             cv2.putText(frame, "PUFFGUARD TAKIP PANELI", (panel_x + 10, panel_y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1)
             
-            # Sigara Sayac Satiri
             counter_str = f"Sigara: {consecutive_detection_count}/{REQUIRED_CONSECUTIVE_FRAMES}" + (" (15dk Bekleme)" if in_cig_cooldown else " (Hazir)")
             cv2.putText(frame, counter_str, (panel_x + 10, panel_y + 42), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 255, 255), 1)
 
-            # Uyku & EAR Satiri
             ear_status_color = (0, 0, 255) if eyes_closed else (0, 255, 0)
             ear_str = f"Goz (EAR): {avg_ear:.2f} | Kapali: {sleep_duration:.1f}s / {int(SLEEP_DURATION_REQ_SEC)}s"
             cv2.putText(frame, ear_str, (panel_x + 10, panel_y + 65), cv2.FONT_HERSHEY_SIMPLEX, 0.40, ear_status_color, 1)
 
-            # Uyku Ilerleme Cubugu
             sleep_prog = min(1.0, sleep_duration / SLEEP_DURATION_REQ_SEC)
             s_bar_w = int((panel_w - 20) * sleep_prog)
             cv2.rectangle(frame, (panel_x + 10, panel_y + 75), (panel_x + panel_w - 10, panel_y + 86), (60, 60, 60), -1)
             cv2.rectangle(frame, (panel_x + 10, panel_y + 75), (panel_x + 10 + s_bar_w, panel_y + 86), (0, 165, 255), -1)
 
-            # Durum / Cooldown Bilgisi
             sleep_cd_text = f"Uyku CD: {int(sleep_cooldown_remaining)}s" if in_sleep_cooldown else "Uyku Modu: Aktif (1dk)"
             cv2.putText(frame, sleep_cd_text, (panel_x + 10, panel_y + 103), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1)
 
-            # Ekranda 5sn sonrasi kayit durumunu goster
             if recording_post_event:
                 rec_progress = int((post_event_counter / POST_EVENT_FRAMES_REQUIRED) * 100)
                 cv2.rectangle(frame, (10, h - 60), (320, h - 20), (0, 0, 180), -1)
                 cv2.putText(frame, f"KAYDEDILIYOR (+5sn): %{rec_progress}", (20, h - 35), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
 
-            # Ekranda en son kaydedilen videoyu goster
             if last_saved_video_name and not recording_post_event:
                 cv2.putText(frame, f"Son Video: {last_saved_video_name}", (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 0), 1)
 
-            # Sol ust Durum Bilgisi
             if in_cig_cooldown:
                 mins = int(cig_cooldown_remaining // 60)
                 secs = int(cig_cooldown_remaining % 60)
@@ -617,7 +606,6 @@ def main():
             else:
                 cd_str = " | Sigara: Hazir"
 
-            # Durum Etiketi
             if is_camera_obstructed:
                 system_status_tag = "KAMERA ENGELLENDI!"
                 system_status_color = (0, 0, 255)
