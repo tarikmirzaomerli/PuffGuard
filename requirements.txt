@@ -1,0 +1,10 @@
+opencv-python>=4.8.0
+mediapipe>=0.10.14
+ultralytics>=8.0.0
+torch>=2.0.0
+torchvision>=0.15.0
+win11toast>=0.36.0; sys_platform == 'win32'
+plyer>=2.1.0
+huggingface-hub>=0.20.0
+roboflow>=1.1.0
+numpy>=1.24.0

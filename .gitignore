@@ -1,0 +1,45 @@
+# Python Sanal Ortamlar
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Byte-compiled / optimize dosyalar
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Yapay Zeka Model Agirliklari (Buyuk Dosyalar)
+*.pt
+*.pth
+*.onnx
+*.engine
+*.tflite
+
+# Kaydedilen Kanit Videolari ve Fotograflar
+cigarettes-foto/
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.jpg
+*.jpeg
+*.png
+
+# Ultralytics & Model Onbellekleri
+runs/
+.cache/
+yolov8*.pt
+
+# IDE ve Editor Ayarlari
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Isletim Sistemi Dosyalari
+.DS_Store
+Thumbs.db
+desktop.ini
