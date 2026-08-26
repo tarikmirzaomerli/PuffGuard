@@ -5,6 +5,7 @@ import time
 import os
 import threading
 import numpy as np
+import pyttsx3
 from datetime import datetime
 from collections import deque
 from ultralytics import YOLO
@@ -21,6 +22,27 @@ os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
 # Proje Kok Dizini
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def speak_text_async(text):
+    """Turkce sesli ikazi arka planda ayri bir thread icinde calistirir (Kamerayi dondurmez)."""
+    def _speak():
+        try:
+            engine = pyttsx3.init()
+            engine.setProperty('rate', 150) # Dogal konusma hizi
+
+            # Turkce ses motoru secimi
+            voices = engine.getProperty('voices')
+            for voice in voices:
+                if 'turkish' in voice.name.lower() or 'tr' in voice.id.lower():
+                    engine.setProperty('voice', voice.id)
+                    break
+
+            engine.say(text)
+            engine.runAndWait()
+        except Exception as e:
+            print(f"[!] Sesli ikaz hatasi: {e}")
+
+    threading.Thread(target=_speak, daemon=True).start()
 
 def send_desktop_notification(title, message):
     """Masaustu bildirimini arka planda asenkron gonderir."""
@@ -218,7 +240,8 @@ def main():
     ) as hands:
 
         print("==================================================")
-        print("PuffGuard - Canny Kenar & Akilli Doku Analizli Takip Aktif.")
+        print("PuffGuard - Sesli Ikazli Guvenlik & Takip Sistemi Aktif.")
+        print(f"- Ses Motoru: pyttsx3 (Turkce, 150 WPM)")
         print(f"- Kamera Engelleme: Kağıt, Bez, Bant, Karartma (Hassas Canny Algılama)")
         print(f"- Masadan Ayrılma: Boş oda kenarları algılanır, sessizce beklenir.")
         print(f"- Uyku Tespiti: Kesintisiz {int(SLEEP_DURATION_REQ_SEC)}s (1 Dakika)")
@@ -250,6 +273,7 @@ def main():
                             "UYARI: Kamera 1 Dakikadır Engellendi!",
                             "Kamera görüntüsü 1 dakikadır alınamıyor. Son geçerli durum kaydedildi."
                         )
+                        speak_text_async("Uyarı! Kamera görüşü engellendi.")
                         last_camera_loss_time = current_time
                 time.sleep(0.1)
                 continue
@@ -307,18 +331,15 @@ def main():
             std_brightness = float(np.std(gray))
             laplacian_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
-            # Canny Kenar Tespiti
             edges = cv2.Canny(gray, 40, 120)
             edge_count = int(np.count_nonzero(edges))
 
             is_camera_obstructed = False
             block_reason = ""
 
-            # 1. Yuz varsa engel kesinlikle yok
             if has_face:
                 is_camera_obstructed = False
             else:
-                # 2. Yuz yok: Zifiri karanlik mi, yoksa kenarsiz/dokusuz kagit-engel mi?
                 if avg_brightness < BRIGHTNESS_OBSTRUCTION_THRESHOLD:
                     is_camera_obstructed = True
                     block_reason = "Karartma / Siyah Kapak"
@@ -326,7 +347,6 @@ def main():
                     is_camera_obstructed = True
                     block_reason = "Kağıt / Lense Yapışık Engel"
                 else:
-                    # Odanin kenarlari, kapisi, tavani, mobilyalari gorunuyor -> Masadan Ayrildi
                     is_camera_obstructed = False
 
             block_duration = 0.0
@@ -336,7 +356,7 @@ def main():
 
                 block_duration = current_time - block_start_time
 
-                # Kesintisiz 1 DAKIKA (60 saniye) engelleme durumunda bildirim ve SS
+                # Kesintisiz 1 DAKIKA (60 saniye) engelleme durumunda bildirim ve SESLI IKAZ
                 if block_duration >= BLOCK_DURATION_REQ_SEC:
                     if (current_time - last_blocked_notification_time) >= SECURITY_NOTIFICATION_COOLDOWN:
                         now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -345,13 +365,15 @@ def main():
                         cv2.imwrite(blocked_photo_path, frame)
                         print(f"\n[!] UYARI: Kamera Önü Engellendi! Fotoğraf: {blocked_photo_name}")
 
+                        # Masaustu Bildirimi & Turkce Sesli Ikaz
                         send_desktop_notification(
                             "UYARI: Kamera Önü Engellendi!",
                             f"Kamera görüşü 1 dakikadır kapalı/engelli ({block_reason}). Son durum fotoğrafı kaydedildi."
                         )
+                        speak_text_async("Uyarı! Kamera görüşü engellendi.")
+
                         last_blocked_notification_time = current_time
 
-                # Ekranda kirmizi engel uyarisi ve sure sayaci
                 cv2.rectangle(frame, (20, h // 2 - 40), (w - 20, h // 2 + 40), (0, 0, 180), -1)
                 cv2.putText(frame, f"UYARI: KAMERA ONU ENGELLENDI ({block_reason}) {block_duration:.1f}s / {int(BLOCK_DURATION_REQ_SEC)}s", (20, h // 2 + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 2)
             else:
@@ -426,10 +448,13 @@ def main():
                         save_video_async(list(frame_buffer), sleep_video_path, w, h, fps=30.0, event_name="1 DAKIKALIK UYKU VIDEOSU")
                         last_saved_video_name = sleep_video_name
 
+                        # Masaustu Bildirimi & Turkce Sesli Ikaz
                         send_desktop_notification(
                             "UYARI: 1 Dakikadır Uyku Halindesiniz!",
                             f"Gözleriniz kesintisiz 1 dakikadır kapalı tespit edildi! 10 sn kanıt videosu '{sleep_video_name}' kaydedildi."
                         )
+                        speak_text_async("Lütfen uyanın! Bir dakikadır uyku halindesiniz.")
+
                         last_sleep_notification_time = current_time
                         print(f"\n[!] 1 DAKIKALIK UYKU ALARMI: 2 dakikalık (120s) uyku soğuma süresi başlatıldı.")
             else:
@@ -501,6 +526,19 @@ def main():
             in_cig_cooldown = (current_time - last_cigarette_notification_time) < CIGARETTE_NOTIFICATION_COOLDOWN
             is_cig_confirmed = consecutive_detection_count >= REQUIRED_CONSECUTIVE_FRAMES
 
+            # 12 Kare Sigara Dogrulandiginda (Bildirim, Sesli Ikaz ve 5sn Sonrasi Video Kaydi)
+            if is_cig_confirmed:
+                if not in_cig_cooldown and not recording_post_event:
+                    recording_post_event = True
+                    post_event_counter = 0
+                    event_timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    print(f"\n[+] SIGARA DOGRULANDI! 5 saniyelik sonrasi kaydediliyor...")
+
+                    # Turkce Sesli Ikaz
+                    speak_text_async("Sigara kullanımı tespit edildi. Kayıt alınıyor.")
+
+                cv2.putText(frame, f"DOGRULANDI: SIGARA (%{int(best_score*100)})", (w // 2 - 210, h - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
             # Sag ust Bilgi Paneli
             panel_w, panel_h = 320, 115
             panel_x = w - panel_w - 10
@@ -532,16 +570,6 @@ def main():
             # Durum / Cooldown Bilgisi
             sleep_cd_text = f"Uyku CD: {int(sleep_cooldown_remaining)}s" if in_sleep_cooldown else "Uyku Modu: Aktif (1dk)"
             cv2.putText(frame, sleep_cd_text, (panel_x + 10, panel_y + 103), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1)
-
-            # 12 Kare Sigara Dogrulandiginda
-            if is_cig_confirmed:
-                if not in_cig_cooldown and not recording_post_event:
-                    recording_post_event = True
-                    post_event_counter = 0
-                    event_timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    print(f"\n[+] SIGARA DOGRULANDI! 5 saniyelik sonrasi kaydediliyor...")
-
-                cv2.putText(frame, f"DOGRULANDI: SIGARA (%{int(best_score*100)})", (w // 2 - 210, h - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
             # Ekranda 5sn sonrasi kayit durumunu goster
             if recording_post_event:
