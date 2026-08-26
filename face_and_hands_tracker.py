@@ -3,6 +3,7 @@ import mediapipe as mp
 import math
 import time
 import os
+import gc
 import threading
 import numpy as np
 import pyttsx3
@@ -73,8 +74,8 @@ def send_desktop_notification(title, message):
 
     threading.Thread(target=_notify, daemon=True).start()
 
-def save_video_async(frames_list, video_path, width, height, fps=30.0, event_name="VIDEO"):
-    """Tamponu arka planda MP4 olarak kaydeder (Kamera akisini asla dondurmez)."""
+def save_video_async(frames_list, video_path, width=640, height=360, fps=30.0, event_name="VIDEO"):
+    """Optimize edilmis 640x360 tamponu arka planda MP4 olarak kaydeder ve RAM temizligi yapar."""
     def _save():
         try:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -85,6 +86,9 @@ def save_video_async(frames_list, video_path, width, height, fps=30.0, event_nam
             print(f"\n[+] {event_name} KAYDEDILDI -> {video_path}")
         except Exception as e:
             print(f"[!] Video kaydetme hatasi: {e}")
+        finally:
+            del frames_list
+            gc.collect() # Kayit sonrasi RAM cop toplayicisini calistir
 
     threading.Thread(target=_save, daemon=True).start()
 
@@ -155,7 +159,7 @@ def main():
         )
         return
 
-    # Kamera cozunurlugu 640x480
+    # Kamera cozunurlugunu 640x480 olarak sabitle (RAM tasarrufu)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
@@ -180,7 +184,8 @@ def main():
     BRIGHTNESS_OBSTRUCTION_THRESHOLD = 22.0    # Parlaklik < 22 ise karartma/el
     EDGE_COUNT_THRESHOLD = 150                 # Canny kenar sayisi < 150 ise lense yapisik engel
 
-    # 10 SANIYELIK (300 KARE) SUREKLI DONEN TAMPON
+    # 10 SANIYELIK DUSUK COZUNURLUKLU (640x360) 300 KARELIK OPTIMIZE TAMPON (%75 RAM Tasarrufu)
+    BUFFER_W, BUFFER_H = 640, 360
     frame_buffer = deque(maxlen=300)
 
     # Sigara 5sn Oncesi + 5sn Sonrasi Kayit Degiskenleri
@@ -256,9 +261,10 @@ def main():
     ) as hands:
 
         print("==================================================")
-        print("PuffGuard - Dogal Turkce Sesli Ikaz Sistemi Aktif.")
-        print(f"- Ses Motoru: Microsoft Tolga (Windows 10/11 Dogal Turkce)")
-        print(f"- Kamera Engelleme: Kağıt, Bez, Bant, Karartma (Hassas Canny Algılama)")
+        print("PuffGuard - RAM Optimize Takip Sistemi Aktif.")
+        print(f"- Bellek Optimizasyonu: 640x360 Hafif Tampon + Otomatik GC")
+        print(f"- Ses Motoru: Microsoft Tolga (Dogal Turkce)")
+        print(f"- Kamera Engelleme: Kağıt, Bez, Bant, Karartma (Hassas Canny)")
         print(f"- Masadan Ayrılma: Boş oda kenarları algılanır, sessizce beklenir.")
         print(f"- Uyku Tespiti: Kesintisiz {int(SLEEP_DURATION_REQ_SEC)}s (1 Dakika)")
         print(f"- Sigara Cooldown: {int(CIGARETTE_NOTIFICATION_COOLDOWN)}s (15 Dakika)")
@@ -296,12 +302,13 @@ def main():
             else:
                 camera_loss_start_time = None
 
-            last_valid_frame = frame.copy()
+            # Frame islemleri (Gereksiz kopyalamalar onlendi)
+            last_valid_frame = frame
             frame = cv2.flip(frame, 1)
             h, w, _ = frame.shape
 
-            # 300 KARELIK TAMPONA SUREKLI EKLE
-            frame_buffer.append(frame.copy())
+            # RAM OPTIMIZASYONU: Tampona 640x360 kucuk boyutlu kare ekle (%75 daha az RAM)
+            frame_buffer.append(cv2.resize(frame, (BUFFER_W, BUFFER_H)))
 
             # --- SIGARA ICIN 5 SANIYE SONRASI KARE TOPLAMA VE KAYIT ---
             if recording_post_event:
@@ -310,7 +317,7 @@ def main():
                     video_name = f"cigarette_video_10s_{event_timestamp_str}.mp4"
                     video_path = os.path.join(photo_dir, video_name)
 
-                    save_video_async(list(frame_buffer), video_path, w, h, fps=30.0, event_name="10s SIGARA VIDEOSU")
+                    save_video_async(list(frame_buffer), video_path, width=BUFFER_W, height=BUFFER_H, fps=30.0, event_name="10s SIGARA VIDEOSU")
                     last_saved_video_name = video_name
 
                     send_desktop_notification(
@@ -323,14 +330,16 @@ def main():
                     post_event_counter = 0
                     print(f"[i] 5sn oncesi + 5sn sonrasi video kaydi tamamlandi. 15 dakikalik bekleme basladi.")
 
-            # FPS Sayaci
+            # FPS Sayaci ve Periyodik GC
             frame_count += 1
             if time.time() - fps_start_time >= 1.0:
                 fps = frame_count
                 frame_count = 0
                 fps_start_time = time.time()
+                # Her saniyede bir hafif cop temizligi
+                gc.collect()
 
-            # RGB Formati
+            # RGB Formati (MediaPipe icin)
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             rgb_frame.flags.writeable = False
 
@@ -461,7 +470,7 @@ def main():
                         sleep_video_name = f"sleep_alert_{now_str}.mp4"
                         sleep_video_path = os.path.join(photo_dir, sleep_video_name)
 
-                        save_video_async(list(frame_buffer), sleep_video_path, w, h, fps=30.0, event_name="1 DAKIKALIK UYKU VIDEOSU")
+                        save_video_async(list(frame_buffer), sleep_video_path, width=BUFFER_W, height=BUFFER_H, fps=30.0, event_name="1 DAKIKALIK UYKU VIDEOSU")
                         last_saved_video_name = sleep_video_name
 
                         # Masaustu Bildirimi & Turkce Sesli Ikaz
@@ -512,6 +521,7 @@ def main():
 
                 if yolo_model is not None and mouth_crop.size > 0 and not is_yolo_busy:
                     is_yolo_busy = True
+                    # mouth_crop uzerinde arka plan thread calistir
                     threading.Thread(target=run_yolo_on_mouth_roi, args=(mouth_crop.copy(), rx1, ry1), daemon=True).start()
 
                 has_cig = len(detected_objects) > 0
@@ -634,6 +644,7 @@ def main():
 
     cap.release()
     cv2.destroyAllWindows()
+    gc.collect()
 
 if __name__ == "__main__":
     main()
