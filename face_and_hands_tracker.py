@@ -136,12 +136,11 @@ def main():
     LEFT_EYE_INDICES = [33, 160, 158, 133, 153, 144]
     RIGHT_EYE_INDICES = [362, 385, 387, 263, 373, 380]
 
-    # --- PARAMETRELER (KAMERA ENGELLEME - 1 DAKIKA KURALI) ---
+    # --- PARAMETRELER (KAMERA ENGELLEME - YUZ BAGIMSIZ 1 DAKIKA KURALI) ---
     BLOCK_DURATION_REQ_SEC = 60.0              # Kesintisiz 1 DAKIKA (60 saniye)
     SECURITY_NOTIFICATION_COOLDOWN = 120.0     # 2 DAKIKA (120 saniye) Cooldown
-    LAPLACIAN_VAR_THRESHOLD = 40.0             # Doku/Kenar keskinligi
-    STD_DEV_THRESHOLD = 18.0                   # Renk homojenligi
-    DARK_THRESHOLD = 35.0                      # Karanlik/Siyah esigi
+    BRIGHTNESS_OBSTRUCTION_THRESHOLD = 20.0    # Parlaklik < 20 ise karartma
+    VARIANCE_OBSTRUCTION_THRESHOLD = 50.0      # Varyans (doku) < 50 ise kagit/engelleme
 
     # 10 SANIYELIK (300 KARE) SUREKLI DONEN TAMPON
     frame_buffer = deque(maxlen=300)
@@ -156,6 +155,7 @@ def main():
     consecutive_detection_count = 0
     sleep_start_time = None
     block_start_time = None
+    camera_loss_start_time = None
     last_cigarette_notification_time = 0.0
     last_sleep_notification_time = 0.0
     last_camera_loss_time = 0.0
@@ -218,10 +218,10 @@ def main():
     ) as hands:
 
         print("==================================================")
-        print("PuffGuard - Gelismis 2.2x Dinamik ROI Sistemi Aktif.")
-        print(f"- Agiz ROI: max(150, int(eye_distance * 2.2))")
+        print("PuffGuard - Akilli 3'lu Guvenlik & Takip Sistemi Aktif.")
+        print(f"- Kamera Engelleme (Yuzden Bagimsiz): Parlaklik < {BRIGHTNESS_OBSTRUCTION_THRESHOLD} veya Varyans < {VARIANCE_OBSTRUCTION_THRESHOLD}")
+        print(f"- Masadan Kalkma: Oda aydinliksa uyarilmaz, sessizce beklenir.")
         print(f"- Uyku Tespiti: Kesintisiz {int(SLEEP_DURATION_REQ_SEC)}s (1 Dakika)")
-        print(f"- Kamera Engelleme: Kesintisiz {int(BLOCK_DURATION_REQ_SEC)}s (1 Dakika)")
         print(f"- Sigara Cooldown: {int(CIGARETTE_NOTIFICATION_COOLDOWN)}s (15 Dakika)")
         print("- Cikis: 'q' tusu")
         print("==================================================")
@@ -230,11 +230,11 @@ def main():
             current_time = time.time()
             success, frame = cap.read()
 
-            # --- 1. GORUNTU KAYBI (FRAME LOSS) ---
+            # --- 1. DONANIM / YAZILIM KAPANMASI (FRAME LOSS) ---
             if not success or frame is None:
-                if block_start_time is None:
-                    block_start_time = current_time
-                loss_duration = current_time - block_start_time
+                if camera_loss_start_time is None:
+                    camera_loss_start_time = current_time
+                loss_duration = current_time - camera_loss_start_time
 
                 if loss_duration >= BLOCK_DURATION_REQ_SEC:
                     if (current_time - last_camera_loss_time) >= SECURITY_NOTIFICATION_COOLDOWN:
@@ -253,6 +253,8 @@ def main():
                         last_camera_loss_time = current_time
                 time.sleep(0.1)
                 continue
+            else:
+                camera_loss_start_time = None
 
             last_valid_frame = frame.copy()
             frame = cv2.flip(frame, 1)
@@ -288,30 +290,19 @@ def main():
                 frame_count = 0
                 fps_start_time = time.time()
 
-            # RGB Formati
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            rgb_frame.flags.writeable = False
-
-            face_results = face_mesh.process(rgb_frame)
-            hand_results = hands.process(rgb_frame)
-
-            rgb_frame.flags.writeable = True
-
-            # --- 2. AKILLI ENGEL / KAGIT / KARARTMA TESPITI (1 DAKIKA KURALI) ---
+            # --- 2. GORUNTU KARARTMA / ENGELLEME ANALIZI (YUZDEN TAMAMEN BAGIMSIZ) ---
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             avg_brightness = float(np.mean(gray))
-            std_brightness = float(np.std(gray))
             laplacian_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
-            has_face = bool(face_results.multi_face_landmarks)
-
+            # Kamera engellendi mi? (Kagit, Bant, El, Karartma) -> Yuz olsun veya olmasin!
             is_camera_obstructed = False
             block_reason = ""
 
-            if avg_brightness < DARK_THRESHOLD:
+            if avg_brightness < BRIGHTNESS_OBSTRUCTION_THRESHOLD:
                 is_camera_obstructed = True
-                block_reason = "Karanlik / Karartma"
-            elif (laplacian_var < LAPLACIAN_VAR_THRESHOLD or std_brightness < STD_DEV_THRESHOLD) and not has_face:
+                block_reason = "Karartma / Siyah Bant"
+            elif laplacian_var < VARIANCE_OBSTRUCTION_THRESHOLD:
                 is_camera_obstructed = True
                 block_reason = "Kagit / Fiziksel Engel"
 
@@ -322,31 +313,45 @@ def main():
 
                 block_duration = current_time - block_start_time
 
+                # Kesintisiz 1 DAKIKA (60 saniye) engelleme durumunda bildirim ve SS
                 if block_duration >= BLOCK_DURATION_REQ_SEC:
                     if (current_time - last_blocked_notification_time) >= SECURITY_NOTIFICATION_COOLDOWN:
                         now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
                         blocked_photo_name = f"camera_blocked_{now_str}.jpg"
                         blocked_photo_path = os.path.join(photo_dir, blocked_photo_name)
                         cv2.imwrite(blocked_photo_path, frame)
-                        print(f"\n[!] UYARI: Kamera 1 Dakikadır Engellendi ({block_reason})! Fotoğraf: {blocked_photo_name}")
+                        print(f"\n[!] UYARI: Kamera Önü Engellendi! Fotoğraf: {blocked_photo_name}")
 
                         send_desktop_notification(
-                            "UYARI: Kamera 1 Dakikadır Engellendi!",
+                            "UYARI: Kamera Önü Engellendi!",
                             f"Kamera görüşü 1 dakikadır kapalı/engelli ({block_reason}). Son durum fotoğrafı kaydedildi."
                         )
                         last_blocked_notification_time = current_time
 
+                # Ekranda kirmizi engel uyarisi ve sure sayaci
                 cv2.rectangle(frame, (20, h // 2 - 40), (w - 20, h // 2 + 40), (0, 0, 180), -1)
-                cv2.putText(frame, f"UYARI: KAMERA ENGELLENDI ({block_reason}) {block_duration:.1f}s / {int(BLOCK_DURATION_REQ_SEC)}s", (25, h // 2 + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2)
+                cv2.putText(frame, f"UYARI: KAMERA ONU ENGELLENDI ({block_reason}) {block_duration:.1f}s / {int(BLOCK_DURATION_REQ_SEC)}s", (20, h // 2 + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 2)
             else:
+                # Engel kalkarsa veya oda aydinliksa sayaci sifirla
                 block_start_time = None
+
+            # RGB Formati
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb_frame.flags.writeable = False
+
+            face_results = face_mesh.process(rgb_frame)
+            hand_results = hands.process(rgb_frame)
+
+            rgb_frame.flags.writeable = True
+
+            has_face = bool(face_results.multi_face_landmarks)
 
             lip_center = None
             eye_distance = 80.0
             avg_ear = 0.35
             eyes_closed = False
 
-            # --- 3. YUZ NIRENGI, IKI GOZ ARASI MESAFE, DUDAK VE UYKU (EAR) ANALIZI ---
+            # --- 3. YUZ NIRENGI, DUDAK VE UYKU (EAR) ANALIZI ---
             if face_results.multi_face_landmarks:
                 for face_landmarks in face_results.multi_face_landmarks:
                     mp_drawing.draw_landmarks(
@@ -357,7 +362,7 @@ def main():
                         connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_contours_style()
                     )
 
-                    # Iki Goz Arasi Mesafe (Sol Goz Dis Kose 33, Sag Goz Dis Kose 263)
+                    # Iki Goz Arasi Mesafe
                     p_left_eye = (face_landmarks.landmark[33].x * w, face_landmarks.landmark[33].y * h)
                     p_right_eye = (face_landmarks.landmark[263].x * w, face_landmarks.landmark[263].y * h)
                     eye_distance = calculate_distance(p_left_eye, p_right_eye)
@@ -437,8 +442,6 @@ def main():
 
             # --- 6. 2.2x CARPANLI VE MINIMUM 150px SINIRLI DINAMIK AGIZ ROI ---
             if lip_center is not None and not is_camera_obstructed:
-                # calculated_size = int(eye_distance * 2.2)
-                # roi_size = max(150, calculated_size)
                 calculated_size = int(eye_distance * 2.2)
                 roi_size = max(150, calculated_size)
                 half_sz = roi_size // 2
@@ -448,7 +451,6 @@ def main():
                 rx2 = min(w, rx1 + roi_size)
                 ry2 = min(h, ry1 + roi_size)
 
-                # Ekran kenarlarinda kirpma alaninin tam kare kalmasini sagla
                 if rx2 - rx1 < roi_size and rx1 > 0:
                     rx1 = max(0, rx2 - roi_size)
                 if ry2 - ry1 < roi_size and ry1 > 0:
@@ -488,7 +490,7 @@ def main():
             in_cig_cooldown = (current_time - last_cigarette_notification_time) < CIGARETTE_NOTIFICATION_COOLDOWN
             is_cig_confirmed = consecutive_detection_count >= REQUIRED_CONSECUTIVE_FRAMES
 
-            # Sag ust Bilgi Paneli (Hem Sigara Hem 1 Dk Uyku Takibi)
+            # Sag ust Bilgi Paneli
             panel_w, panel_h = 320, 115
             panel_x = w - panel_w - 10
             panel_y = 10
@@ -505,7 +507,7 @@ def main():
             counter_str = f"Sigara: {consecutive_detection_count}/{REQUIRED_CONSECUTIVE_FRAMES}" + (" (15dk Bekleme)" if in_cig_cooldown else " (Hazir)")
             cv2.putText(frame, counter_str, (panel_x + 10, panel_y + 42), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 255, 255), 1)
 
-            # Uyku & EAR Satiri (1 Dakika Sureli)
+            # Uyku & EAR Satiri
             ear_status_color = (0, 0, 255) if eyes_closed else (0, 255, 0)
             ear_str = f"Goz (EAR): {avg_ear:.2f} | Kapali: {sleep_duration:.1f}s / {int(SLEEP_DURATION_REQ_SEC)}s"
             cv2.putText(frame, ear_str, (panel_x + 10, panel_y + 65), cv2.FONT_HERSHEY_SIMPLEX, 0.40, ear_status_color, 1)
@@ -550,9 +552,25 @@ def main():
             else:
                 cd_str = " | Sigara: Hazir"
 
-            status_text = f"FPS: {fps} | " + ("ENGEL/KAGIT!" if is_camera_obstructed else ("1DK UYKU ALARMI!" if sleep_duration >= SLEEP_DURATION_REQ_SEC else ("ONAYLANDI!" if is_cig_confirmed else "NORMAL"))) + cd_str
-            status_color = (0, 0, 255) if (is_cig_confirmed or is_camera_obstructed or sleep_duration >= SLEEP_DURATION_REQ_SEC) else (0, 255, 0)
-            cv2.putText(frame, status_text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.42, status_color, 1)
+            # Durum Etiketi: Engel mi, Masadan Ayrilma mi, Normal mi?
+            if is_camera_obstructed:
+                system_status_tag = "KAMERA ENGELLENDI!"
+                system_status_color = (0, 0, 255)
+            elif not has_face:
+                system_status_tag = "MASADAN AYRILDI (BEKLEMEDE)"
+                system_status_color = (255, 200, 0)
+            elif sleep_duration >= SLEEP_DURATION_REQ_SEC:
+                system_status_tag = "1DK UYKU ALARMI!"
+                system_status_color = (0, 0, 255)
+            elif is_cig_confirmed:
+                system_status_tag = "SIGARA ONAYLANDI!"
+                system_status_color = (0, 0, 255)
+            else:
+                system_status_tag = "NORMAL (AKTIF)"
+                system_status_color = (0, 255, 0)
+
+            status_text = f"FPS: {fps} | {system_status_tag}{cd_str}"
+            cv2.putText(frame, status_text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.40, system_status_color, 1)
 
             cv2.imshow("PuffGuard - Sigara & Uyku Takip Sistemi", frame)
 
