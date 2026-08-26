@@ -136,12 +136,11 @@ def main():
     LEFT_EYE_INDICES = [33, 160, 158, 133, 153, 144]
     RIGHT_EYE_INDICES = [362, 385, 387, 263, 373, 380]
 
-    # --- PARAMETRELER (KAMERA ENGELLEME - 1 DAKIKA KURALI) ---
+    # --- PARAMETRELER (KAMERA ENGELLEME - GERCEK FIZIKSEL ENGEL ESIKLERI) ---
     BLOCK_DURATION_REQ_SEC = 60.0              # Kesintisiz 1 DAKIKA (60 saniye)
     SECURITY_NOTIFICATION_COOLDOWN = 120.0     # 2 DAKIKA (120 saniye) Cooldown
-    BRIGHTNESS_OBSTRUCTION_THRESHOLD = 18.0    # Parlaklik < 18 ise karartma
-    FLAT_TEXTURE_STD_THRESHOLD = 12.0          # Renk homojenligi < 12 ise kagit/kapak
-    FLAT_LAPLACIAN_THRESHOLD = 15.0            # Doku keskinligi < 15 ise kagit/kapak
+    TRUE_BLACKOUT_THRESHOLD = 10.0             # Tam zifiri karanlik / bant (< 10)
+    TRUE_FLAT_PAPER_STD = 6.0                  # Lense yapisan kagit/kapak (< 6.0 std dev)
 
     # 10 SANIYELIK (300 KARE) SUREKLI DONEN TAMPON
     frame_buffer = deque(maxlen=300)
@@ -219,9 +218,9 @@ def main():
     ) as hands:
 
         print("==================================================")
-        print("PuffGuard - Akilli Engel & Takip Sistemi Aktif.")
-        print(f"- Kamera Engelleme: Kağıt / Karartma (1 Dakika Kesintisiz)")
-        print(f"- Masadan Ayrılma: Oda aydınlıksa uyarılmaz, sessizce beklenir.")
+        print("PuffGuard - Akilli Ayrimli Takip Sistemi Aktif.")
+        print(f"- Kamera Engelleme: Zifiri Karanlik (<{TRUE_BLACKOUT_THRESHOLD}) veya Duz Kagit (<{TRUE_FLAT_PAPER_STD} std)")
+        print(f"- Masadan Ayrılma: Oda aciksa sessizce beklemede kalir.")
         print(f"- Uyku Tespiti: Kesintisiz {int(SLEEP_DURATION_REQ_SEC)}s (1 Dakika)")
         print(f"- Sigara Cooldown: {int(CIGARETTE_NOTIFICATION_COOLDOWN)}s (15 Dakika)")
         print("- Cikis: 'q' tusu")
@@ -302,29 +301,22 @@ def main():
 
             has_face = bool(face_results.multi_face_landmarks)
 
-            # --- 2. GORUNTU KARARTMA / ENGELLEME ANALIZI (HATASIZ GUCLU MANTIK) ---
+            # --- 2. GORUNTU KARARTMA / ENGELLEME ANALIZI (BOS ODA ILE KAGIT AYRIMI) ---
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             avg_brightness = float(np.mean(gray))
             std_brightness = float(np.std(gray))
-            laplacian_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
             is_camera_obstructed = False
             block_reason = ""
 
-            # Eger yuz gorunuyorsa kamera KESINLIKLE engelli degildir!
-            if has_face:
-                is_camera_obstructed = False
-            else:
-                # Yuz yok: Siyah kapak/el mi, yoksa duz kagit mi?
-                if avg_brightness < BRIGHTNESS_OBSTRUCTION_THRESHOLD:
-                    is_camera_obstructed = True
-                    block_reason = "Karartma / Siyah Bant"
-                elif (std_brightness < FLAT_TEXTURE_STD_THRESHOLD and laplacian_var < FLAT_LAPLACIAN_THRESHOLD):
-                    is_camera_obstructed = True
-                    block_reason = "Kagit / Fiziksel Engel"
-                else:
-                    # Yuz yok ama oda gorunuyor (Aydinlik & Detayli) -> Kullanici Masadan Kalkti
-                    is_camera_obstructed = False
+            # Yalnizca lens tam kapatildiginda (parlaklik < 10 veya std dev < 6.0) engelli kabul edilir
+            # Bos oda / duvarda std dev genelde 15-50 arasidir, bu yuzden bos oda asla engelli sayilmaz!
+            if avg_brightness < TRUE_BLACKOUT_THRESHOLD:
+                is_camera_obstructed = True
+                block_reason = "Karartma / Siyah Kapak"
+            elif std_brightness < TRUE_FLAT_PAPER_STD and not has_face:
+                is_camera_obstructed = True
+                block_reason = "Kağıt / Lense Yapışık Engel"
 
             block_duration = 0.0
             if is_camera_obstructed:
@@ -352,6 +344,7 @@ def main():
                 cv2.rectangle(frame, (20, h // 2 - 40), (w - 20, h // 2 + 40), (0, 0, 180), -1)
                 cv2.putText(frame, f"UYARI: KAMERA ONU ENGELLENDI ({block_reason}) {block_duration:.1f}s / {int(BLOCK_DURATION_REQ_SEC)}s", (20, h // 2 + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 2)
             else:
+                # Normal oda gorundugunde sayaci sifirla
                 block_start_time = None
 
             lip_center = None
