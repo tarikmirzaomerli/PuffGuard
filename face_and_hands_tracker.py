@@ -56,21 +56,17 @@ def calculate_distance(p1, p2):
 
 def calculate_ear(eye_points, landmarks, width, height):
     """MediaPipe nirengi noktalarindan Eye Aspect Ratio (EAR) hesaplar."""
-    # eye_points sirasi: [P1(dis kose), P2(ust1), P3(ust2), P4(ic kose), P5(alt2), P6(alt1)]
     coords = []
     for idx in eye_points:
         lm = landmarks[idx]
         coords.append((lm.x * width, lm.y * height))
 
-    # Dikey mesafeler
     v1 = calculate_distance(coords[1], coords[5]) # P2 - P6
     v2 = calculate_distance(coords[2], coords[4]) # P3 - P5
-
-    # Yatay mesafe
     h = calculate_distance(coords[0], coords[3])  # P1 - P4
 
     if h == 0:
-        return 0.3 # Bolme hatasi onleme
+        return 0.3
 
     ear = (v1 + v2) / (2.0 * h)
     return ear
@@ -132,21 +128,21 @@ def main():
     ALLOWED_CLASSES = {"cigarette"}            # Hedef sinif
     CIGARETTE_NOTIFICATION_COOLDOWN = 900.0    # 15 DAKIKA (900 saniye) Cooldown
 
-    # --- PARAMETRELER (UYKU / DROWSINESS) ---
+    # --- PARAMETRELER (UYKU / DROWSINESS - 1 DAKIKA KURALI) ---
     EAR_THRESHOLD = 0.20                       # EAR < 0.20 ise goz kapali
-    SLEEP_CONSECUTIVE_FRAMES_REQ = 90          # 3 saniye kesintisiz kapali goz (90 kare)
+    SLEEP_DURATION_REQ_SEC = 60.0              # Kesintisiz 1 DAKIKA (60 saniye / 1800 kare)
     SLEEP_NOTIFICATION_COOLDOWN = 120.0        # 2 DAKIKA (120 saniye) Uyku Cooldown
 
-    # MediaPipe Goz Landmark Indeksleri: [P1, P2, P3, P4, P5, P6]
+    # MediaPipe Goz Landmark Indeksleri
     LEFT_EYE_INDICES = [33, 160, 158, 133, 153, 144]
     RIGHT_EYE_INDICES = [362, 385, 387, 263, 373, 380]
 
-    # --- GUVENLIK PARAMETRELERI ---
-    SECURITY_NOTIFICATION_COOLDOWN = 10.0      # Kamera engel/kayip icin 10 saniye
-    BLOCK_DURATION_REQ = 1.5                   # 1.5 saniye kesintisiz engelleme
+    # --- PARAMETRELER (KAMERA ENGELLEME - 1 DAKIKA KURALI) ---
+    BLOCK_DURATION_REQ_SEC = 60.0              # Kesintisiz 1 DAKIKA (60 saniye)
+    SECURITY_NOTIFICATION_COOLDOWN = 120.0     # 2 DAKIKA (120 saniye) Cooldown
     LAPLACIAN_VAR_THRESHOLD = 40.0             # Doku/Kenar keskinligi
     STD_DEV_THRESHOLD = 18.0                   # Renk homojenligi
-    DARK_THRESHOLD = 40.0                      # Karanlik/Siyah esigi
+    DARK_THRESHOLD = 35.0                      # Karanlik/Siyah esigi
 
     # 10 SANIYELIK (300 KARE) SUREKLI DONEN TAMPON
     frame_buffer = deque(maxlen=300)
@@ -157,14 +153,14 @@ def main():
     post_event_counter = 0
     event_timestamp_str = ""
 
-    # Durum ve sayac degiskenleri
+    # Zamanlayici ve durum degiskenleri
     consecutive_detection_count = 0
-    sleep_closed_frame_count = 0
+    sleep_start_time = None                    # 1 dakikalik uyku zaman baslangici
+    block_start_time = None                    # 1 dakikalik engel zaman baslangici
     last_cigarette_notification_time = 0.0
     last_sleep_notification_time = 0.0
     last_camera_loss_time = 0.0
     last_blocked_notification_time = 0.0
-    block_start_time = None
     last_valid_frame = None
     last_saved_video_name = ""
 
@@ -222,11 +218,12 @@ def main():
     ) as hands:
 
         print("==================================================")
-        print("PuffGuard - Sigara & Uyku Takip Sistemi Aktif.")
-        print(f"- Proje Klasoru: {PROJECT_DIR}")
-        print(f"- Uyku Tespiti (EAR): Esik < {EAR_THRESHOLD}, Sure: {SLEEP_CONSECUTIVE_FRAMES_REQ} Kare (3s)")
-        print(f"- Uyku Cooldown: {int(SLEEP_NOTIFICATION_COOLDOWN)}s (2 Dakika)")
-        print(f"- Sigara Cooldown: {int(CIGARETTE_NOTIFICATION_COOLDOWN)}s (15 Dakika)")
+        print("PuffGuard - Guncellenmis Zamanlama Parametreleri Aktif.")
+        print(f"- Uyku Tespiti: Kesintisiz {int(SLEEP_DURATION_REQ_SEC)} Saniye (1 Dakika) [EAR < {EAR_THRESHOLD}]")
+        print(f"- Uyku Cooldown: {int(SLEEP_NOTIFICATION_COOLDOWN)} Saniye (2 Dakika)")
+        print(f"- Kamera Engelleme Tespiti: Kesintisiz {int(BLOCK_DURATION_REQ_SEC)} Saniye (1 Dakika)")
+        print(f"- Kamera Engelleme Cooldown: {int(SECURITY_NOTIFICATION_COOLDOWN)} Saniye (2 Dakika)")
+        print(f"- Sigara Cooldown: {int(CIGARETTE_NOTIFICATION_COOLDOWN)} Saniye (15 Dakika)")
         print("- Cikis: 'q' tusu")
         print("==================================================")
 
@@ -236,21 +233,25 @@ def main():
 
             # --- 1. GORUNTU KAYBI (FRAME LOSS) ---
             if not success or frame is None:
-                if (current_time - last_camera_loss_time) >= SECURITY_NOTIFICATION_COOLDOWN:
-                    print("\n[!] UYARI: Kamera Bağlantısı Kesildi!")
-                    if last_valid_frame is not None:
-                        now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        closed_photo_name = f"camera_closed_{now_str}.jpg"
-                        closed_photo_path = os.path.join(photo_dir, closed_photo_name)
-                        cv2.imwrite(closed_photo_path, last_valid_frame)
-                        print(f"[+] Kapanmadan onceki kare kaydedildi: {closed_photo_path}")
+                if block_start_time is None:
+                    block_start_time = current_time
+                loss_duration = current_time - block_start_time
 
-                    send_desktop_notification(
-                        "UYARI: Kamera Bağlantısı Kesildi!",
-                        "Kamera görüntüsü alınamıyor. Son kare kaydedildi."
-                    )
-                    last_camera_loss_time = current_time
+                if loss_duration >= BLOCK_DURATION_REQ_SEC:
+                    if (current_time - last_camera_loss_time) >= SECURITY_NOTIFICATION_COOLDOWN:
+                        print("\n[!] UYARI: Kamera 1 Dakikadır Bağlantısız veya Kapatıldı!")
+                        if last_valid_frame is not None:
+                            now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            closed_photo_name = f"camera_closed_{now_str}.jpg"
+                            closed_photo_path = os.path.join(photo_dir, closed_photo_name)
+                            cv2.imwrite(closed_photo_path, last_valid_frame)
+                            print(f"[+] Kapanmadan onceki kare kaydedildi: {closed_photo_path}")
 
+                        send_desktop_notification(
+                            "UYARI: Kamera 1 Dakikadır Engellendi!",
+                            "Kamera görüntüsü 1 dakikadır alınamıyor. Son geçerli durum kaydedildi."
+                        )
+                        last_camera_loss_time = current_time
                 time.sleep(0.1)
                 continue
 
@@ -297,7 +298,7 @@ def main():
 
             rgb_frame.flags.writeable = True
 
-            # --- 2. AKILLI ENGEL / KAGIT / KARARTMA TESPITI ---
+            # --- 2. AKILLI ENGEL / KAGIT / KARARTMA TESPITI (1 DAKIKA KURALI) ---
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             avg_brightness = float(np.mean(gray))
             std_brightness = float(np.std(gray))
@@ -315,36 +316,40 @@ def main():
                 is_camera_obstructed = True
                 block_reason = "Kagit / Fiziksel Engel"
 
+            block_duration = 0.0
             if is_camera_obstructed:
                 if block_start_time is None:
                     block_start_time = current_time
 
                 block_duration = current_time - block_start_time
 
-                if block_duration >= BLOCK_DURATION_REQ:
+                # Kesintisiz 1 DAKIKA (60 saniye) engelleme durumunda bildirim ve SS
+                if block_duration >= BLOCK_DURATION_REQ_SEC:
                     if (current_time - last_blocked_notification_time) >= SECURITY_NOTIFICATION_COOLDOWN:
                         now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
                         blocked_photo_name = f"camera_blocked_{now_str}.jpg"
                         blocked_photo_path = os.path.join(photo_dir, blocked_photo_name)
                         cv2.imwrite(blocked_photo_path, frame)
-                        print(f"\n[!] UYARI: Kamera Görüşü Engellendi ({block_reason})! Fotoğraf: {blocked_photo_name}")
+                        print(f"\n[!] UYARI: Kamera 1 Dakikadır Engellendi ({block_reason})! Fotoğraf: {blocked_photo_name}")
 
                         send_desktop_notification(
-                            "UYARI: Kamera Görüşü Engellendi!",
-                            f"Kamera görüşü {block_duration:.1f} saniyedir engellendi ({block_reason}). Kanıt kaydedildi."
+                            "UYARI: Kamera 1 Dakikadır Engellendi!",
+                            f"Kamera görüşü 1 dakikadır kapalı/engelli ({block_reason}). Son durum fotoğrafı kaydedildi."
                         )
                         last_blocked_notification_time = current_time
 
+                # Ekranda kirmizi engel uyarisi ve sure sayaci
                 cv2.rectangle(frame, (20, h // 2 - 40), (w - 20, h // 2 + 40), (0, 0, 180), -1)
-                cv2.putText(frame, f"UYARI: KAMERA GORUSU ENGELLENDI ({block_reason}) {block_duration:.1f}s", (35, h // 2 + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+                cv2.putText(frame, f"UYARI: KAMERA ENGELLENDI ({block_reason}) {block_duration:.1f}s / {int(BLOCK_DURATION_REQ_SEC)}s", (25, h // 2 + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2)
             else:
+                # 1 dakika dolmadan engel kalkarsa sayaci sifirla
                 block_start_time = None
 
             lip_center = None
             avg_ear = 0.35
             eyes_closed = False
 
-            # --- 3. YUZ NIRNEGI, DUDAK VE UYKU (EAR) ANALIZI ---
+            # --- 3. YUZ NIRENGI, DUDAK VE UYKU (EAR) ANALIZI ---
             if face_results.multi_face_landmarks:
                 for face_landmarks in face_results.multi_face_landmarks:
                     mp_drawing.draw_landmarks(
@@ -373,7 +378,7 @@ def main():
                     right_ear = calculate_ear(RIGHT_EYE_INDICES, face_landmarks.landmark, w, h)
                     avg_ear = (left_ear + right_ear) / 2.0
 
-                    # Gozlerin uzerine minik nirengi noktalari ciz
+                    # Gozlerin uzerine nirengi noktalari ciz
                     for idx in (LEFT_EYE_INDICES + RIGHT_EYE_INDICES):
                         elm = face_landmarks.landmark[idx]
                         cv2.circle(frame, (int(elm.x * w), int(elm.y * h)), 2, (0, 255, 255), -1)
@@ -381,36 +386,41 @@ def main():
                     if avg_ear < EAR_THRESHOLD:
                         eyes_closed = True
 
-            # --- 4. UYKU / DROWSINESS SAYACI VE BILDIRIM MANTIGI ---
+            # --- 4. UYKU / DROWSINESS SAYACI (1 DAKIKA KURALI) ---
             sleep_cooldown_remaining = max(0.0, SLEEP_NOTIFICATION_COOLDOWN - (current_time - last_sleep_notification_time))
             in_sleep_cooldown = (current_time - last_sleep_notification_time) < SLEEP_NOTIFICATION_COOLDOWN
 
+            sleep_duration = 0.0
             if eyes_closed and not is_camera_obstructed and has_face:
-                sleep_closed_frame_count += 1
+                if sleep_start_time is None:
+                    sleep_start_time = current_time
+
+                sleep_duration = current_time - sleep_start_time
+
+                # Kesintisiz 1 DAKIKA (60 saniye) boyunca goz kapali kalirsa
+                if sleep_duration >= SLEEP_DURATION_REQ_SEC:
+                    cv2.rectangle(frame, (20, h - 100), (w - 20, h - 55), (0, 0, 220), -1)
+                    cv2.putText(frame, "UYARI: 1 DAKIKADIR UYKU HALINDESINIZ!", (35, h - 70), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+
+                    if not in_sleep_cooldown:
+                        now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        sleep_video_name = f"sleep_alert_{now_str}.mp4"
+                        sleep_video_path = os.path.join(photo_dir, sleep_video_name)
+
+                        # 10 saniyelik video kaydet
+                        save_video_async(list(frame_buffer), sleep_video_path, w, h, fps=30.0, event_name="1 DAKIKALIK UYKU VIDEOSU")
+                        last_saved_video_name = sleep_video_name
+
+                        # 1 Dakika Uyku Bildirimi
+                        send_desktop_notification(
+                            "UYARI: 1 Dakikadır Uyku Halindesiniz!",
+                            f"Gözleriniz kesintisiz 1 dakikadır kapalı tespit edildi! 10 sn kanıt videosu '{sleep_video_name}' kaydedildi."
+                        )
+                        last_sleep_notification_time = current_time
+                        print(f"\n[!] 1 DAKIKALIK UYKU ALARMI: 2 dakikalık (120s) uyku soğuma süresi başlatıldı.")
             else:
-                sleep_closed_frame_count = 0
-
-            # 3 saniye kesintisiz goz kapali kaldiginda (90 kare)
-            if sleep_closed_frame_count >= SLEEP_CONSECUTIVE_FRAMES_REQ:
-                cv2.rectangle(frame, (20, h - 100), (w - 20, h - 55), (0, 0, 220), -1)
-                cv2.putText(frame, "UYARI: UYKUYA DALDINIZ! GOZLERINIZI ACIN!", (35, h - 70), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
-
-                if not in_sleep_cooldown:
-                    now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    sleep_video_name = f"sleep_alert_{now_str}.mp4"
-                    sleep_video_path = os.path.join(photo_dir, sleep_video_name)
-
-                    # 10 saniyelik video kaydet
-                    save_video_async(list(frame_buffer), sleep_video_path, w, h, fps=30.0, event_name="UYKU VIDEOSU")
-                    last_saved_video_name = sleep_video_name
-
-                    # Bildirim gonder
-                    send_desktop_notification(
-                        "UYARI: Uykuya Daldınız!",
-                        f"Gözleriniz 3 saniyeden uzun süredir kapalı tespit edildi! '{sleep_video_name}' kaydedildi."
-                    )
-                    last_sleep_notification_time = current_time
-                    print(f"\n[!] UYKU ALARMI: 120 saniyelik uyku soğuma süresi başlatıldı.")
+                # Goz 1 dakika dolmadan acilirsa sayaci aninda sifirla
+                sleep_start_time = None
 
             # 5. El Landmarklari
             if hand_results.multi_hand_landmarks:
@@ -475,13 +485,13 @@ def main():
             in_cig_cooldown = (current_time - last_cigarette_notification_time) < CIGARETTE_NOTIFICATION_COOLDOWN
             is_cig_confirmed = consecutive_detection_count >= REQUIRED_CONSECUTIVE_FRAMES
 
-            # Sag ust Bilgi Paneli (Hem Sigara Hem Uyku Takibi)
-            panel_w, panel_h = 310, 115
+            # Sag ust Bilgi Paneli (Hem Sigara Hem 1 Dk Uyku Takibi)
+            panel_w, panel_h = 320, 115
             panel_x = w - panel_w - 10
             panel_y = 10
 
             overlay = frame.copy()
-            bg_col = (0, 0, 200) if (is_cig_confirmed or sleep_closed_frame_count >= SLEEP_CONSECUTIVE_FRAMES_REQ) else (40, 40, 40)
+            bg_col = (0, 0, 200) if (is_cig_confirmed or sleep_duration >= SLEEP_DURATION_REQ_SEC) else (40, 40, 40)
             cv2.rectangle(overlay, (panel_x, panel_y), (panel_x + panel_w, panel_y + panel_h), bg_col, -1)
             cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
             cv2.rectangle(frame, (panel_x, panel_y), (panel_x + panel_w, panel_y + panel_h), (255, 255, 255), 1)
@@ -490,24 +500,24 @@ def main():
             
             # Sigara Sayac Satiri
             counter_str = f"Sigara: {consecutive_detection_count}/{REQUIRED_CONSECUTIVE_FRAMES}" + (" (15dk Bekleme)" if in_cig_cooldown else " (Hazir)")
-            cv2.putText(frame, counter_str, (panel_x + 10, panel_y + 42), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1)
+            cv2.putText(frame, counter_str, (panel_x + 10, panel_y + 42), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 255, 255), 1)
 
-            # Uyku & EAR Satiri
+            # Uyku & EAR Satiri (1 Dakika Sureli)
             ear_status_color = (0, 0, 255) if eyes_closed else (0, 255, 0)
-            ear_str = f"Goz (EAR): {avg_ear:.2f} | Kapali: {sleep_closed_frame_count}/{SLEEP_CONSECUTIVE_FRAMES_REQ}"
-            cv2.putText(frame, ear_str, (panel_x + 10, panel_y + 65), cv2.FONT_HERSHEY_SIMPLEX, 0.42, ear_status_color, 1)
+            ear_str = f"Goz (EAR): {avg_ear:.2f} | Kapali: {sleep_duration:.1f}s / {int(SLEEP_DURATION_REQ_SEC)}s"
+            cv2.putText(frame, ear_str, (panel_x + 10, panel_y + 65), cv2.FONT_HERSHEY_SIMPLEX, 0.40, ear_status_color, 1)
 
-            # Uyku Ilerleme Cubugu
-            sleep_prog = min(1.0, sleep_closed_frame_count / SLEEP_CONSECUTIVE_FRAMES_REQ)
+            # Uyku Ilerleme Cubugu (60 saniye hedefine gore)
+            sleep_prog = min(1.0, sleep_duration / SLEEP_DURATION_REQ_SEC)
             s_bar_w = int((panel_w - 20) * sleep_prog)
             cv2.rectangle(frame, (panel_x + 10, panel_y + 75), (panel_x + panel_w - 10, panel_y + 86), (60, 60, 60), -1)
             cv2.rectangle(frame, (panel_x + 10, panel_y + 75), (panel_x + 10 + s_bar_w, panel_y + 86), (0, 165, 255), -1)
 
             # Durum / Cooldown Bilgisi
-            sleep_cd_text = f"Uyku CD: {int(sleep_cooldown_remaining)}s" if in_sleep_cooldown else "Uyku: Aktif"
+            sleep_cd_text = f"Uyku CD: {int(sleep_cooldown_remaining)}s" if in_sleep_cooldown else "Uyku Modu: Aktif (1dk)"
             cv2.putText(frame, sleep_cd_text, (panel_x + 10, panel_y + 103), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1)
 
-            # 12 Kare Sigara Dogrulandiginda (5sn sonrasini topla)
+            # 12 Kare Sigara Dogrulandiginda
             if is_cig_confirmed:
                 if not in_cig_cooldown and not recording_post_event:
                     recording_post_event = True
@@ -537,8 +547,8 @@ def main():
             else:
                 cd_str = " | Sigara: Hazir"
 
-            status_text = f"FPS: {fps} | " + ("ENGEL/KAGIT!" if is_camera_obstructed else ("UYKU/ALARM!" if sleep_closed_frame_count >= SLEEP_CONSECUTIVE_FRAMES_REQ else ("ONAYLANDI!" if is_cig_confirmed else "NORMAL"))) + cd_str
-            status_color = (0, 0, 255) if (is_cig_confirmed or is_camera_obstructed or sleep_closed_frame_count >= SLEEP_CONSECUTIVE_FRAMES_REQ) else (0, 255, 0)
+            status_text = f"FPS: {fps} | " + ("ENGEL/KAGIT!" if is_camera_obstructed else ("1DK UYKU ALARMI!" if sleep_duration >= SLEEP_DURATION_REQ_SEC else ("ONAYLANDI!" if is_cig_confirmed else "NORMAL"))) + cd_str
+            status_color = (0, 0, 255) if (is_cig_confirmed or is_camera_obstructed or sleep_duration >= SLEEP_DURATION_REQ_SEC) else (0, 255, 0)
             cv2.putText(frame, status_text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.42, status_color, 1)
 
             cv2.imshow("PuffGuard - Sigara & Uyku Takip Sistemi", frame)

@@ -13,15 +13,15 @@ Laptop kamerası üzerinden gerçek zamanlı **sigara tüketimi**, **el-ağız h
 - **Gecikmeli Video Kaydı:** Sigara tespit edildiğinde olayın **5 saniye öncesini ve 5 saniye sonrasını** kapsayan toplam 10 saniyelik MP4 video kaydı (`cigarette_video_10s_YYYYMMDD_HHMMSS.mp4`).
 - **15 Dakikalık (900 sn) Cooldown:** Üst üste bildirim yağmurunu önleyen bağımsız soğuma süresi.
 
-### 2. 😴 Uyku & Uyuşukluk Tespiti (Eye Aspect Ratio - EAR)
-- MediaPipe yüz nirengi noktaları üzerinden sağ ve sol gözün dikey ve yatay mesafelerini sürekli analiz ederek **EAR (Eye Aspect Ratio)** değerini hesaplar.
-- **Göz Kapalı Eşiği:** `EAR < 0.20` olduğunda gözler kapalı kabul edilir.
-- **3 Saniyelik (90 Kare) Kesintisiz Alarm:** Gözler aralıksız 3 saniye kapalı kaldığında **"UYARI: Uykuya Daldınız!"** masaüstü uyarısı tetiklenir.
+### 2. 😴 Uyku & Uyuşukluk Tespiti (1 Dakika Kuralı & EAR Analizi)
+- MediaPipe yüz nirengi noktaları üzerinden **EAR (Eye Aspect Ratio)** değerini gerçek zamanlı hesaplar (`EAR < 0.20` ise göz kapalı).
+- **1 Dakikalık (60 Saniye) Kesintisiz Alarm:** Gözler aralıksız **1 dakika (60 saniye)** boyunca kapalı kaldığında **"UYARI: 1 Dakikadır Uyku Halindesiniz!"** masaüstü uyarısı gönderilir. Göz 1 dakika dolmadan açılırsa sayaç hemen sıfırlanır.
 - **Kanıt Videosu:** Olay anının 10 saniyelik videosu `sleep_alert_YYYYMMDD_HHMMSS.mp4` adıyla kaydedilir.
 - **2 Dakikalık (120 sn) Cooldown:** Uyku alarmları için bağımsız 2 dakikalık soğuma süresi.
 
-### 3. 🛡️ Kamera Güvenlik ve Engel Kontrolü
-- Kameranın kapatılması, kağıt/bezle engellenmesi veya karartılması durumunda doku ve parlaklık analizi ile otomatik uyarı verir ve kanıt fotoğrafı kaydeder.
+### 3. 🛡️ Kamera Güvenlik ve Engel Kontrolü (1 Dakika Kuralı)
+- Kameranın kapatılması, kağıt/bezle engellenmesi veya karartılması durumunda anında alarm vermek yerine kesintisiz **1 dakika (60 saniye)** beklenir; engelleme sürerse **"UYARI: Kamera 1 Dakikadır Engellendi!"** bildirimi atılır ve son durum kaydı alınır.
+- **2 Dakikalık (120 sn) Cooldown:** Güvenlik alarmları için bağımsız 2 dakikalık soğuma süresi.
 
 ### 4. ⚡ %100 Ücretsiz & Yerel
 - Tüm işlemler yerel CPU/GPU üzerinde çalışır, harici bulut API'si veya ücretli servis gerektirmez.
