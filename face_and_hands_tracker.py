@@ -136,11 +136,11 @@ def main():
     LEFT_EYE_INDICES = [33, 160, 158, 133, 153, 144]
     RIGHT_EYE_INDICES = [362, 385, 387, 263, 373, 380]
 
-    # --- PARAMETRELER (KAMERA ENGELLEME - GERCEK FIZIKSEL ENGEL ESIKLERI) ---
+    # --- PARAMETRELER (KAMERA ENGELLEME - CANNY KENAR & DOKU ANALIZI) ---
     BLOCK_DURATION_REQ_SEC = 60.0              # Kesintisiz 1 DAKIKA (60 saniye)
     SECURITY_NOTIFICATION_COOLDOWN = 120.0     # 2 DAKIKA (120 saniye) Cooldown
-    TRUE_BLACKOUT_THRESHOLD = 10.0             # Tam zifiri karanlik / bant (< 10)
-    TRUE_FLAT_PAPER_STD = 6.0                  # Lense yapisan kagit/kapak (< 6.0 std dev)
+    BRIGHTNESS_OBSTRUCTION_THRESHOLD = 22.0    # Parlaklik < 22 ise karartma/el
+    EDGE_COUNT_THRESHOLD = 150                 # Canny kenar sayisi < 150 ise lense yapisik engel
 
     # 10 SANIYELIK (300 KARE) SUREKLI DONEN TAMPON
     frame_buffer = deque(maxlen=300)
@@ -218,9 +218,9 @@ def main():
     ) as hands:
 
         print("==================================================")
-        print("PuffGuard - Akilli Ayrimli Takip Sistemi Aktif.")
-        print(f"- Kamera Engelleme: Zifiri Karanlik (<{TRUE_BLACKOUT_THRESHOLD}) veya Duz Kagit (<{TRUE_FLAT_PAPER_STD} std)")
-        print(f"- Masadan Ayrılma: Oda aciksa sessizce beklemede kalir.")
+        print("PuffGuard - Canny Kenar & Akilli Doku Analizli Takip Aktif.")
+        print(f"- Kamera Engelleme: Kağıt, Bez, Bant, Karartma (Hassas Canny Algılama)")
+        print(f"- Masadan Ayrılma: Boş oda kenarları algılanır, sessizce beklenir.")
         print(f"- Uyku Tespiti: Kesintisiz {int(SLEEP_DURATION_REQ_SEC)}s (1 Dakika)")
         print(f"- Sigara Cooldown: {int(CIGARETTE_NOTIFICATION_COOLDOWN)}s (15 Dakika)")
         print("- Cikis: 'q' tusu")
@@ -301,22 +301,33 @@ def main():
 
             has_face = bool(face_results.multi_face_landmarks)
 
-            # --- 2. GORUNTU KARARTMA / ENGELLEME ANALIZI (BOS ODA ILE KAGIT AYRIMI) ---
+            # --- 2. HASSAS CANNY KENAR & DOKU ANALIZI ILE ENGELLEME TESPITI ---
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             avg_brightness = float(np.mean(gray))
             std_brightness = float(np.std(gray))
+            laplacian_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+            # Canny Kenar Tespiti
+            edges = cv2.Canny(gray, 40, 120)
+            edge_count = int(np.count_nonzero(edges))
 
             is_camera_obstructed = False
             block_reason = ""
 
-            # Yalnizca lens tam kapatildiginda (parlaklik < 10 veya std dev < 6.0) engelli kabul edilir
-            # Bos oda / duvarda std dev genelde 15-50 arasidir, bu yuzden bos oda asla engelli sayilmaz!
-            if avg_brightness < TRUE_BLACKOUT_THRESHOLD:
-                is_camera_obstructed = True
-                block_reason = "Karartma / Siyah Kapak"
-            elif std_brightness < TRUE_FLAT_PAPER_STD and not has_face:
-                is_camera_obstructed = True
-                block_reason = "Kağıt / Lense Yapışık Engel"
+            # 1. Yuz varsa engel kesinlikle yok
+            if has_face:
+                is_camera_obstructed = False
+            else:
+                # 2. Yuz yok: Zifiri karanlik mi, yoksa kenarsiz/dokusuz kagit-engel mi?
+                if avg_brightness < BRIGHTNESS_OBSTRUCTION_THRESHOLD:
+                    is_camera_obstructed = True
+                    block_reason = "Karartma / Siyah Kapak"
+                elif edge_count < EDGE_COUNT_THRESHOLD and (std_brightness < 14.0 or laplacian_var < 25.0):
+                    is_camera_obstructed = True
+                    block_reason = "Kağıt / Lense Yapışık Engel"
+                else:
+                    # Odanin kenarlari, kapisi, tavani, mobilyalari gorunuyor -> Masadan Ayrildi
+                    is_camera_obstructed = False
 
             block_duration = 0.0
             if is_camera_obstructed:
@@ -344,7 +355,6 @@ def main():
                 cv2.rectangle(frame, (20, h // 2 - 40), (w - 20, h // 2 + 40), (0, 0, 180), -1)
                 cv2.putText(frame, f"UYARI: KAMERA ONU ENGELLENDI ({block_reason}) {block_duration:.1f}s / {int(BLOCK_DURATION_REQ_SEC)}s", (20, h // 2 + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 2)
             else:
-                # Normal oda gorundugunde sayaci sifirla
                 block_start_time = None
 
             lip_center = None
@@ -553,7 +563,7 @@ def main():
             else:
                 cd_str = " | Sigara: Hazir"
 
-            # Durum Etiketi: Engel mi, Masadan Ayrilma mi, Normal mi?
+            # Durum Etiketi
             if is_camera_obstructed:
                 system_status_tag = "KAMERA ENGELLENDI!"
                 system_status_color = (0, 0, 255)
