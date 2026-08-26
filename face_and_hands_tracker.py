@@ -180,7 +180,6 @@ def main():
     def run_yolo_on_mouth_roi(roi_img, offset_x, offset_y):
         nonlocal is_yolo_busy, detected_objects, last_seen_time
         try:
-            # ROI boyutuna gore dinamik goruntu giris olcegi
             img_dim = max(160, (roi_img.shape[0] // 32) * 32)
             results = yolo_model(roi_img, conf=CONFIDENCE_THRESHOLD, verbose=False, imgsz=img_dim)
             current_boxes = []
@@ -219,8 +218,8 @@ def main():
     ) as hands:
 
         print("==================================================")
-        print("PuffGuard - Dinamik Olcekli ROI & Takip Sistemi Aktif.")
-        print(f"- Agiz Kirpma: Yuz Genisligine Orantili (Dinamik Olcek)")
+        print("PuffGuard - Gelismis 2.2x Dinamik ROI Sistemi Aktif.")
+        print(f"- Agiz ROI: max(150, int(eye_distance * 2.2))")
         print(f"- Uyku Tespiti: Kesintisiz {int(SLEEP_DURATION_REQ_SEC)}s (1 Dakika)")
         print(f"- Kamera Engelleme: Kesintisiz {int(BLOCK_DURATION_REQ_SEC)}s (1 Dakika)")
         print(f"- Sigara Cooldown: {int(CIGARETTE_NOTIFICATION_COOLDOWN)}s (15 Dakika)")
@@ -323,7 +322,6 @@ def main():
 
                 block_duration = current_time - block_start_time
 
-                # Kesintisiz 1 DAKIKA (60 saniye) engelleme durumunda bildirim ve SS
                 if block_duration >= BLOCK_DURATION_REQ_SEC:
                     if (current_time - last_blocked_notification_time) >= SECURITY_NOTIFICATION_COOLDOWN:
                         now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -344,11 +342,11 @@ def main():
                 block_start_time = None
 
             lip_center = None
-            face_width = 100
+            eye_distance = 80.0
             avg_ear = 0.35
             eyes_closed = False
 
-            # --- 3. YUZ NIRENGI, DINAMIK YUZ GENISLIGI, DUDAK VE UYKU (EAR) ANALIZI ---
+            # --- 3. YUZ NIRENGI, IKI GOZ ARASI MESAFE, DUDAK VE UYKU (EAR) ANALIZI ---
             if face_results.multi_face_landmarks:
                 for face_landmarks in face_results.multi_face_landmarks:
                     mp_drawing.draw_landmarks(
@@ -359,11 +357,10 @@ def main():
                         connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_contours_style()
                     )
 
-                    # Dinamik Yuz Olcegi (Iki goz arasi / Yanak genisligi)
-                    # Sol goz dis kose (33), Sag goz dis kose (263)
+                    # Iki Goz Arasi Mesafe (Sol Goz Dis Kose 33, Sag Goz Dis Kose 263)
                     p_left_eye = (face_landmarks.landmark[33].x * w, face_landmarks.landmark[33].y * h)
                     p_right_eye = (face_landmarks.landmark[263].x * w, face_landmarks.landmark[263].y * h)
-                    face_width = calculate_distance(p_left_eye, p_right_eye)
+                    eye_distance = calculate_distance(p_left_eye, p_right_eye)
 
                     # Dudak Merkezi
                     lip_x = []
@@ -401,7 +398,6 @@ def main():
 
                 sleep_duration = current_time - sleep_start_time
 
-                # Kesintisiz 1 DAKIKA (60 saniye) boyunca goz kapali kalirsa
                 if sleep_duration >= SLEEP_DURATION_REQ_SEC:
                     cv2.rectangle(frame, (20, h - 100), (w - 20, h - 55), (0, 0, 220), -1)
                     cv2.putText(frame, "UYARI: 1 DAKIKADIR UYKU HALINDESINIZ!", (35, h - 70), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
@@ -439,22 +435,24 @@ def main():
                     hand_label = handedness.classification[0].label
                     cv2.circle(frame, (ix, iy), 7, (0, 255, 0), cv2.FILLED)
 
-            # --- 6. DINAMIK YUZ GENISLIGINE GORE ADAPTIF AGIZ KIRPMA (ROI) ---
+            # --- 6. 2.2x CARPANLI VE MINIMUM 150px SINIRLI DINAMIK AGIZ ROI ---
             if lip_center is not None and not is_camera_obstructed:
-                # Yuz yaklasirsa buyur, uzaklasirsa kuculur (Minimum 100px guvenlik esigi)
-                adaptive_crop_size = max(100, int(face_width * 1.5))
-                half_sz = adaptive_crop_size // 2
+                # calculated_size = int(eye_distance * 2.2)
+                # roi_size = max(150, calculated_size)
+                calculated_size = int(eye_distance * 2.2)
+                roi_size = max(150, calculated_size)
+                half_sz = roi_size // 2
 
                 rx1 = max(0, lip_center[0] - half_sz)
                 ry1 = max(0, lip_center[1] - half_sz)
-                rx2 = min(w, rx1 + adaptive_crop_size)
-                ry2 = min(h, ry1 + adaptive_crop_size)
+                rx2 = min(w, rx1 + roi_size)
+                ry2 = min(h, ry1 + roi_size)
 
-                # Ekran kenarlarinda kirpma alanini koru
-                if rx2 - rx1 < adaptive_crop_size and rx1 > 0:
-                    rx1 = max(0, rx2 - adaptive_crop_size)
-                if ry2 - ry1 < adaptive_crop_size and ry1 > 0:
-                    ry1 = max(0, ry2 - adaptive_crop_size)
+                # Ekran kenarlarinda kirpma alaninin tam kare kalmasini sagla
+                if rx2 - rx1 < roi_size and rx1 > 0:
+                    rx1 = max(0, rx2 - roi_size)
+                if ry2 - ry1 < roi_size and ry1 > 0:
+                    ry1 = max(0, ry2 - roi_size)
 
                 mouth_crop = frame[ry1:ry2, rx1:rx2]
 
@@ -465,7 +463,7 @@ def main():
                 has_cig = len(detected_objects) > 0
                 roi_box_color = (0, 0, 255) if has_cig else (255, 255, 0)
                 cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), roi_box_color, 2)
-                cv2.putText(frame, f"Dinamik ROI {adaptive_crop_size}x{adaptive_crop_size}", (rx1, max(15, ry1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, roi_box_color, 1)
+                cv2.putText(frame, f"Dinamik ROI {roi_size}x{roi_size} (2.2x)", (rx1, max(15, ry1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, roi_box_color, 1)
 
             # 7. Sigara Dogrulama Sayaci (12 Kare)
             is_currently_detected = len(detected_objects) > 0 or (current_time - last_seen_time < 0.35)
