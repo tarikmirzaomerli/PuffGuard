@@ -1,13 +1,19 @@
-﻿import cv2
+﻿import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+
+import torch
+torch.set_num_threads(1)
+
+import cv2
 import mediapipe as mp
 import math
 import time
-import os
 import gc
 import threading
 import numpy as np
 import pyttsx3
-import torch
 from datetime import datetime
 from collections import deque
 from ultralytics import YOLO
@@ -19,8 +25,6 @@ try:
 except Exception:
     USE_WIN11TOAST = False
     from plyer import notification
-
-os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
 # Proje Kok Dizini
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -74,7 +78,7 @@ def send_desktop_notification(title, message):
     threading.Thread(target=_notify, daemon=True).start()
 
 def save_compressed_video_async(compressed_frames_list, video_path, width=640, height=360, fps=30.0, event_name="VIDEO"):
-    """Sıkıştırılmış JPEG tamponunu decode edip MP4 yazar ve RAM'i tamamen serbest bırakır."""
+    """Sikistirilmis JPEG tamponunu decode edip MP4 yazar ve RAM'i tamamen serbest birakir."""
     def _save():
         try:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -116,27 +120,35 @@ def calculate_ear(eye_points, landmarks, width, height):
     ear = (v1 + v2) / (2.0 * h)
     return ear
 
-def load_roboflow_yolo():
-    """Model agirligini proje dizininden yukler."""
+def load_lightweight_onnx_model():
+    """YOLO modelini en hafif ONNX Runtime formatiyla yukler."""
     print("==================================================")
-    print("[+] Model yukleniyor...")
-    model_path = os.path.join(PROJECT_DIR, "best.pt")
+    print("[+] Hafif ONNX Modeli kontrol ediliyor...")
+    onnx_path = os.path.join(PROJECT_DIR, "best.onnx")
+    pt_path = os.path.join(PROJECT_DIR, "best.pt")
 
-    if not os.path.exists(model_path):
-        model_path = "best.pt"
+    if not os.path.exists(onnx_path) and os.path.exists(pt_path):
+        print("[+] 'best.pt' ONNX formatina donusturuluyor (imgsz=160)...")
+        temp_model = YOLO(pt_path)
+        temp_model.export(format="onnx", imgsz=160)
+        del temp_model
+        gc.collect()
 
-    if os.path.exists(model_path):
-        print(f"[+] YOLO modeli yukleniyor: '{model_path}'")
-        model = YOLO(model_path)
-        print(f"[+] Model basariyla yuklendi! Siniflar: {model.names}")
+    if os.path.exists(onnx_path):
+        print(f"[+] Hafif ONNX Runtime Modeli yukleniyor: '{onnx_path}'")
+        model = YOLO(onnx_path, task='detect')
+        print(f"[+] ONNX Modeli basariyla yuklendi! Siniflar: {model.names}")
         print("==================================================")
         return model
+    elif os.path.exists(pt_path):
+        print(f"[!] ONNX bulunamadi, 'best.pt' yukleniyor...")
+        return YOLO(pt_path)
     else:
-        print("[!] 'best.pt' modeli bulunamadi!")
+        print("[!] Model dosyasi bulunamadi!")
         return None
 
 def main():
-    # 1. Proje Icindeki 'cigarettes-foto' Klasorunu Olustur / Kontrol Et
+    # 1. Proje Icindeki 'cigarettes-foto' Klasorunu Olustur
     photo_dir = os.path.join(PROJECT_DIR, 'cigarettes-foto')
     if not os.path.exists(photo_dir):
         os.makedirs(photo_dir, exist_ok=True)
@@ -144,10 +156,10 @@ def main():
     else:
         print(f"[+] Kayit klasoru hazir: {photo_dir}")
 
-    # 2. YOLO Modelini Yukleme
-    yolo_model = load_roboflow_yolo()
+    # 2. Hafif ONNX Modelini Yukleme
+    yolo_model = load_lightweight_onnx_model()
 
-    # 3. MediaPipe Modulleri
+    # 3. MediaPipe Modulleri (Bellek icin yalnizca 1 yuz ve 1 el)
     mp_face_mesh = mp.solutions.face_mesh
     mp_hands = mp.solutions.hands
     mp_drawing = mp.solutions.drawing_utils
@@ -162,7 +174,7 @@ def main():
         )
         return
 
-    # Kamera cozunurlugunu 640x480 olarak sabitle (RAM ve CPU tasarrufu)
+    # Kamera cozunurlugunu 640x480 olarak sabitle
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
@@ -181,13 +193,13 @@ def main():
     LEFT_EYE_INDICES = [33, 160, 158, 133, 153, 144]
     RIGHT_EYE_INDICES = [362, 385, 387, 263, 373, 380]
 
-    # --- PARAMETRELER (KAMERA ENGELLEME - CANNY KENAR & DOKU ANALIZI) ---
+    # --- PARAMETRELER (KAMERA ENGELLEME) ---
     BLOCK_DURATION_REQ_SEC = 60.0              # Kesintisiz 1 DAKIKA (60 saniye)
     SECURITY_NOTIFICATION_COOLDOWN = 120.0     # 2 DAKIKA (120 saniye) Cooldown
     BRIGHTNESS_OBSTRUCTION_THRESHOLD = 22.0    # Parlaklik < 22 ise karartma/el
     EDGE_COUNT_THRESHOLD = 150                 # Canny kenar sayisi < 150 ise lense yapisik engel
 
-    # JPEG SIKISTIRILMIS 300 KARELIK TAMPO (RAM kullanimi 1.5 GB'tan 20-30 MB'a duser!)
+    # JPEG SIKISTIRILMIS 300 KARELIK TAMPON (RAM SADECE ~25 MB)
     BUFFER_W, BUFFER_H = 640, 360
     frame_buffer = deque(maxlen=300)
 
@@ -218,7 +230,7 @@ def main():
     detected_objects = []
     last_seen_time = 0.0
 
-    # Frame Skipping (Kare Atlama) onbellek degiskenleri
+    # Frame Skipping onbellek degiskenleri
     cached_has_face = False
     cached_lip_center = None
     cached_eye_distance = 80.0
@@ -226,6 +238,7 @@ def main():
     cached_eyes_closed = False
     cached_is_obstructed = False
     cached_block_reason = ""
+    cached_hand_pos = None
 
     lip_indices = set()
     for conn in mp_face_mesh.FACEMESH_LIPS:
@@ -236,7 +249,6 @@ def main():
         nonlocal is_yolo_busy, detected_objects, last_seen_time
         try:
             img_dim = max(160, (roi_img.shape[0] // 32) * 32)
-            # RADIKAL OPTIMIZASYON: PyTorch Gradients Kapatma & Cache Temizleme
             with torch.no_grad():
                 results = yolo_model(roi_img, conf=CONFIDENCE_THRESHOLD, verbose=False, imgsz=img_dim)
                 current_boxes = []
@@ -258,43 +270,44 @@ def main():
                             print(f"[*] SIGARA YAKALANDI: %{int(conf*100)}")
 
                 detected_objects = current_boxes
-                del results # YOLO sonuc nesnesini RAM'den hemen sil
+                del results
         except Exception as e:
             pass
         finally:
             del roi_img
             is_yolo_busy = False
 
+    # RADIKAL OPTIMIZASYON: max_num_faces=1 ve max_num_hands=1 ile tek kisi ve tek el takibi
     with mp_face_mesh.FaceMesh(
         max_num_faces=1,
         refine_landmarks=False,
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5
     ) as face_mesh, mp_hands.Hands(
-        max_num_hands=2,
+        max_num_hands=1,
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5
     ) as hands:
 
         print("==================================================")
-        print("PuffGuard - Sifir Bellek Sizintili (Zero Leak) Sistem Aktif.")
-        print(f"- Sıkıştırılmış JPEG Tampon: 300 Kare ~25 MB RAM (%98 Tasarruf)")
-        print(f"- Kare Atlama (Frame Skipping): %50 CPU/RAM Tasarrufu")
-        print(f"- PyTorch No-Grad & Anlik GC: Aktif")
-        print(f"- Ses Motoru: Microsoft Tolga (Dogal Turkce)")
+        print("PuffGuard - ONNX Runtime & Lazy Execution Sistemi Aktif.")
+        print(f"- Model Motoru: ONNX Runtime (Düşük RAM & Tek Thread)")
+        print(f"- Tetiklemeli YOLO: Yalnızca el ağza yaklaştığında çalışır.")
+        print(f"- Sıkıştırılmış JPEG Tampon: 300 Kare ~25 MB RAM")
+        print(f"- Ses Motoru: Microsoft Tolga (Doğal Türkçe)")
         print(f"- Uyku Tespiti: Kesintisiz {int(SLEEP_DURATION_REQ_SEC)}s (1 Dakika)")
         print(f"- Sigara Cooldown: {int(CIGARETTE_NOTIFICATION_COOLDOWN)}s (15 Dakika)")
-        print("- Cikis: 'q' tusu")
+        print("- Çıkış: 'q' tuşu")
         print("==================================================")
 
         while True:
             current_time = time.time()
             frame_counter += 1
-            process_ai_this_frame = (frame_counter % 2 == 0) # 2 karede 1 yapay zeka analizi (Frame Skipping)
+            process_ai_this_frame = (frame_counter % 2 == 0)
 
             success, frame = cap.read()
 
-            # --- 1. DONANIM / YAZILIM KAPANMASI (FRAME LOSS) ---
+            # --- 1. DONANIM / YAZILIM KAPANMASI ---
             if not success or frame is None:
                 if camera_loss_start_time is None:
                     camera_loss_start_time = current_time
@@ -325,7 +338,7 @@ def main():
             frame = cv2.flip(frame, 1)
             h, w, _ = frame.shape
 
-            # RADIKAL RAM OPTIMIZASYONU: Kareyi JPEG olarak sikistirip sakla (1.5 GB -> 25 MB)
+            # Sıkıştırılmış JPEG Tampon
             small_resized = cv2.resize(frame, (BUFFER_W, BUFFER_H))
             _, enc_frame = cv2.imencode('.jpg', small_resized, [cv2.IMWRITE_JPEG_QUALITY, 70])
             frame_buffer.append(enc_frame)
@@ -358,7 +371,7 @@ def main():
                 fps_start_time = time.time()
                 gc.collect()
 
-            # --- YALNIZCA CIFTLI KARELERDE AI ISLEMLERINI YURUT (FRAME SKIPPING) ---
+            # --- FRAME SKIPPING: 2 KAREDE 1 AI ANALIZI ---
             if process_ai_this_frame:
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 rgb_frame.flags.writeable = False
@@ -395,7 +408,6 @@ def main():
 
                 del gray, edges
 
-                # Yuz ve Dudak Noktalari
                 cached_lip_center = None
                 cached_eyes_closed = False
 
@@ -422,16 +434,17 @@ def main():
                         if cached_avg_ear < EAR_THRESHOLD:
                             cached_eyes_closed = True
 
-                # El Cizimleri
+                # El Konumu Takibi
+                cached_hand_pos = None
                 if hand_results.multi_hand_landmarks:
-                    for hand_landmarks, handedness in zip(hand_results.multi_hand_landmarks, hand_results.multi_handedness):
+                    for hand_landmarks in hand_results.multi_hand_landmarks:
                         index_tip = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
                         ix, iy = int(index_tip.x * w), int(index_tip.y * h)
+                        cached_hand_pos = (ix, iy)
                         cv2.circle(frame, (ix, iy), 6, (0, 255, 0), cv2.FILLED)
 
                 del face_results, hand_results, rgb_frame
 
-            # Onbellekteki Degerleri Kullan
             has_face = cached_has_face
             is_camera_obstructed = cached_is_obstructed
             block_reason = cached_block_reason
@@ -439,6 +452,7 @@ def main():
             eye_distance = cached_eye_distance
             avg_ear = cached_avg_ear
             eyes_closed = cached_eyes_closed
+            hand_pos = cached_hand_pos
 
             # --- 2. ENGELLEME SURE VE IKAZ SAYACI ---
             block_duration = 0.0
@@ -501,7 +515,8 @@ def main():
             else:
                 sleep_start_time = None
 
-            # --- 4. DINAMIK AGIZ ROI & YOLO ---
+            # --- 4. RADIKAL LAZY EXECUTION: TETIKLEMELI ONNX YOLO ---
+            is_hand_near_mouth = False
             if lip_center is not None and not is_camera_obstructed:
                 calculated_size = int(eye_distance * 2.2)
                 roi_size = max(150, calculated_size)
@@ -517,22 +532,35 @@ def main():
                 if ry2 - ry1 < roi_size and ry1 > 0:
                     ry1 = max(0, ry2 - roi_size)
 
+                # El Agza Yakin mi Kontrolu (Lazy Trigger)
+                if hand_pos is not None:
+                    hand_dist = calculate_distance(hand_pos, lip_center)
+                    # El agiz ROI cercevesinin icinde veya yakinindaysa tetikle
+                    if hand_dist <= (roi_size * 1.1):
+                        is_hand_near_mouth = True
+
                 mouth_crop = frame[ry1:ry2, rx1:rx2]
 
-                if yolo_model is not None and mouth_crop.size > 0 and not is_yolo_busy and process_ai_this_frame:
+                # YOLO YALNIZCA EL AGZA YAKINSA VE AI KARESIYSE CALISIR!
+                if yolo_model is not None and mouth_crop.size > 0 and not is_yolo_busy and process_ai_this_frame and is_hand_near_mouth:
                     is_yolo_busy = True
                     threading.Thread(target=run_yolo_on_mouth_roi, args=(mouth_crop.copy(), rx1, ry1), daemon=True).start()
+                elif not is_hand_near_mouth:
+                    # El agizdan uzaksa eski tespitleri temizle
+                    if (current_time - last_seen_time) > 0.4:
+                        detected_objects = []
 
                 has_cig = len(detected_objects) > 0
-                roi_box_color = (0, 0, 255) if has_cig else (255, 255, 0)
+                roi_box_color = (0, 0, 255) if has_cig else ((0, 255, 255) if is_hand_near_mouth else (120, 120, 120))
                 cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), roi_box_color, 2)
-                cv2.putText(frame, f"Dinamik ROI {roi_size}x{roi_size} (2.2x)", (rx1, max(15, ry1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, roi_box_color, 1)
+                roi_label = f"ONNX ROI {roi_size}x{roi_size}" + (" [YOLO AKTIF]" if is_hand_near_mouth else " [BEKLEMEDE]")
+                cv2.putText(frame, roi_label, (rx1, max(15, ry1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.40, roi_box_color, 1)
 
             # 5. Sigara Dogrulama Sayaci (12 Kare)
             is_currently_detected = len(detected_objects) > 0 or (current_time - last_seen_time < 0.35)
             best_score = 0.0
 
-            if is_currently_detected and not is_camera_obstructed:
+            if is_currently_detected and not is_camera_obstructed and is_hand_near_mouth:
                 consecutive_detection_count += 1
                 for fx1, fy1, fx2, fy2, label, conf in detected_objects:
                     if conf > best_score:
