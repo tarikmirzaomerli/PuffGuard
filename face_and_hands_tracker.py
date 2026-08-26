@@ -122,7 +122,6 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
     # --- PARAMETRELER (SIGARA) ---
-    MOUTH_CROP_SIZE = 150                      # Agiz kesme boyutu (150x150 px)
     CONFIDENCE_THRESHOLD = 0.65                # Guven Esigi (%65)
     REQUIRED_CONSECUTIVE_FRAMES = 12           # 12 Kesintisiz Kare Dogrulamasi
     ALLOWED_CLASSES = {"cigarette"}            # Hedef sinif
@@ -130,7 +129,7 @@ def main():
 
     # --- PARAMETRELER (UYKU / DROWSINESS - 1 DAKIKA KURALI) ---
     EAR_THRESHOLD = 0.20                       # EAR < 0.20 ise goz kapali
-    SLEEP_DURATION_REQ_SEC = 60.0              # Kesintisiz 1 DAKIKA (60 saniye / 1800 kare)
+    SLEEP_DURATION_REQ_SEC = 60.0              # Kesintisiz 1 DAKIKA (60 saniye)
     SLEEP_NOTIFICATION_COOLDOWN = 120.0        # 2 DAKIKA (120 saniye) Uyku Cooldown
 
     # MediaPipe Goz Landmark Indeksleri
@@ -155,8 +154,8 @@ def main():
 
     # Zamanlayici ve durum degiskenleri
     consecutive_detection_count = 0
-    sleep_start_time = None                    # 1 dakikalik uyku zaman baslangici
-    block_start_time = None                    # 1 dakikalik engel zaman baslangici
+    sleep_start_time = None
+    block_start_time = None
     last_cigarette_notification_time = 0.0
     last_sleep_notification_time = 0.0
     last_camera_loss_time = 0.0
@@ -181,7 +180,9 @@ def main():
     def run_yolo_on_mouth_roi(roi_img, offset_x, offset_y):
         nonlocal is_yolo_busy, detected_objects, last_seen_time
         try:
-            results = yolo_model(roi_img, conf=CONFIDENCE_THRESHOLD, verbose=False, imgsz=160)
+            # ROI boyutuna gore dinamik goruntu giris olcegi
+            img_dim = max(160, (roi_img.shape[0] // 32) * 32)
+            results = yolo_model(roi_img, conf=CONFIDENCE_THRESHOLD, verbose=False, imgsz=img_dim)
             current_boxes = []
 
             for r in results:
@@ -218,12 +219,11 @@ def main():
     ) as hands:
 
         print("==================================================")
-        print("PuffGuard - Guncellenmis Zamanlama Parametreleri Aktif.")
-        print(f"- Uyku Tespiti: Kesintisiz {int(SLEEP_DURATION_REQ_SEC)} Saniye (1 Dakika) [EAR < {EAR_THRESHOLD}]")
-        print(f"- Uyku Cooldown: {int(SLEEP_NOTIFICATION_COOLDOWN)} Saniye (2 Dakika)")
-        print(f"- Kamera Engelleme Tespiti: Kesintisiz {int(BLOCK_DURATION_REQ_SEC)} Saniye (1 Dakika)")
-        print(f"- Kamera Engelleme Cooldown: {int(SECURITY_NOTIFICATION_COOLDOWN)} Saniye (2 Dakika)")
-        print(f"- Sigara Cooldown: {int(CIGARETTE_NOTIFICATION_COOLDOWN)} Saniye (15 Dakika)")
+        print("PuffGuard - Dinamik Olcekli ROI & Takip Sistemi Aktif.")
+        print(f"- Agiz Kirpma: Yuz Genisligine Orantili (Dinamik Olcek)")
+        print(f"- Uyku Tespiti: Kesintisiz {int(SLEEP_DURATION_REQ_SEC)}s (1 Dakika)")
+        print(f"- Kamera Engelleme: Kesintisiz {int(BLOCK_DURATION_REQ_SEC)}s (1 Dakika)")
+        print(f"- Sigara Cooldown: {int(CIGARETTE_NOTIFICATION_COOLDOWN)}s (15 Dakika)")
         print("- Cikis: 'q' tusu")
         print("==================================================")
 
@@ -338,18 +338,17 @@ def main():
                         )
                         last_blocked_notification_time = current_time
 
-                # Ekranda kirmizi engel uyarisi ve sure sayaci
                 cv2.rectangle(frame, (20, h // 2 - 40), (w - 20, h // 2 + 40), (0, 0, 180), -1)
                 cv2.putText(frame, f"UYARI: KAMERA ENGELLENDI ({block_reason}) {block_duration:.1f}s / {int(BLOCK_DURATION_REQ_SEC)}s", (25, h // 2 + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2)
             else:
-                # 1 dakika dolmadan engel kalkarsa sayaci sifirla
                 block_start_time = None
 
             lip_center = None
+            face_width = 100
             avg_ear = 0.35
             eyes_closed = False
 
-            # --- 3. YUZ NIRENGI, DUDAK VE UYKU (EAR) ANALIZI ---
+            # --- 3. YUZ NIRENGI, DINAMIK YUZ GENISLIGI, DUDAK VE UYKU (EAR) ANALIZI ---
             if face_results.multi_face_landmarks:
                 for face_landmarks in face_results.multi_face_landmarks:
                     mp_drawing.draw_landmarks(
@@ -359,6 +358,12 @@ def main():
                         landmark_drawing_spec=None,
                         connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_contours_style()
                     )
+
+                    # Dinamik Yuz Olcegi (Iki goz arasi / Yanak genisligi)
+                    # Sol goz dis kose (33), Sag goz dis kose (263)
+                    p_left_eye = (face_landmarks.landmark[33].x * w, face_landmarks.landmark[33].y * h)
+                    p_right_eye = (face_landmarks.landmark[263].x * w, face_landmarks.landmark[263].y * h)
+                    face_width = calculate_distance(p_left_eye, p_right_eye)
 
                     # Dudak Merkezi
                     lip_x = []
@@ -378,7 +383,6 @@ def main():
                     right_ear = calculate_ear(RIGHT_EYE_INDICES, face_landmarks.landmark, w, h)
                     avg_ear = (left_ear + right_ear) / 2.0
 
-                    # Gozlerin uzerine nirengi noktalari ciz
                     for idx in (LEFT_EYE_INDICES + RIGHT_EYE_INDICES):
                         elm = face_landmarks.landmark[idx]
                         cv2.circle(frame, (int(elm.x * w), int(elm.y * h)), 2, (0, 255, 255), -1)
@@ -407,11 +411,9 @@ def main():
                         sleep_video_name = f"sleep_alert_{now_str}.mp4"
                         sleep_video_path = os.path.join(photo_dir, sleep_video_name)
 
-                        # 10 saniyelik video kaydet
                         save_video_async(list(frame_buffer), sleep_video_path, w, h, fps=30.0, event_name="1 DAKIKALIK UYKU VIDEOSU")
                         last_saved_video_name = sleep_video_name
 
-                        # 1 Dakika Uyku Bildirimi
                         send_desktop_notification(
                             "UYARI: 1 Dakikadır Uyku Halindesiniz!",
                             f"Gözleriniz kesintisiz 1 dakikadır kapalı tespit edildi! 10 sn kanıt videosu '{sleep_video_name}' kaydedildi."
@@ -419,7 +421,6 @@ def main():
                         last_sleep_notification_time = current_time
                         print(f"\n[!] 1 DAKIKALIK UYKU ALARMI: 2 dakikalık (120s) uyku soğuma süresi başlatıldı.")
             else:
-                # Goz 1 dakika dolmadan acilirsa sayaci aninda sifirla
                 sleep_start_time = None
 
             # 5. El Landmarklari
@@ -438,18 +439,22 @@ def main():
                     hand_label = handedness.classification[0].label
                     cv2.circle(frame, (ix, iy), 7, (0, 255, 0), cv2.FILLED)
 
-            # 6. Dudak Merkezli 150x150 ROI Kirpma & YOLO Inference
+            # --- 6. DINAMIK YUZ GENISLIGINE GORE ADAPTIF AGIZ KIRPMA (ROI) ---
             if lip_center is not None and not is_camera_obstructed:
-                half_sz = MOUTH_CROP_SIZE // 2
+                # Yuz yaklasirsa buyur, uzaklasirsa kuculur (Minimum 100px guvenlik esigi)
+                adaptive_crop_size = max(100, int(face_width * 1.5))
+                half_sz = adaptive_crop_size // 2
+
                 rx1 = max(0, lip_center[0] - half_sz)
                 ry1 = max(0, lip_center[1] - half_sz)
-                rx2 = min(w, rx1 + MOUTH_CROP_SIZE)
-                ry2 = min(h, ry1 + MOUTH_CROP_SIZE)
+                rx2 = min(w, rx1 + adaptive_crop_size)
+                ry2 = min(h, ry1 + adaptive_crop_size)
 
-                if rx2 - rx1 < MOUTH_CROP_SIZE and rx1 > 0:
-                    rx1 = max(0, rx2 - MOUTH_CROP_SIZE)
-                if ry2 - ry1 < MOUTH_CROP_SIZE and ry1 > 0:
-                    ry1 = max(0, ry2 - MOUTH_CROP_SIZE)
+                # Ekran kenarlarinda kirpma alanini koru
+                if rx2 - rx1 < adaptive_crop_size and rx1 > 0:
+                    rx1 = max(0, rx2 - adaptive_crop_size)
+                if ry2 - ry1 < adaptive_crop_size and ry1 > 0:
+                    ry1 = max(0, ry2 - adaptive_crop_size)
 
                 mouth_crop = frame[ry1:ry2, rx1:rx2]
 
@@ -460,7 +465,7 @@ def main():
                 has_cig = len(detected_objects) > 0
                 roi_box_color = (0, 0, 255) if has_cig else (255, 255, 0)
                 cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), roi_box_color, 2)
-                cv2.putText(frame, "Agiz ROI 150x150", (rx1, max(15, ry1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, roi_box_color, 1)
+                cv2.putText(frame, f"Dinamik ROI {adaptive_crop_size}x{adaptive_crop_size}", (rx1, max(15, ry1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, roi_box_color, 1)
 
             # 7. Sigara Dogrulama Sayaci (12 Kare)
             is_currently_detected = len(detected_objects) > 0 or (current_time - last_seen_time < 0.35)
@@ -507,7 +512,7 @@ def main():
             ear_str = f"Goz (EAR): {avg_ear:.2f} | Kapali: {sleep_duration:.1f}s / {int(SLEEP_DURATION_REQ_SEC)}s"
             cv2.putText(frame, ear_str, (panel_x + 10, panel_y + 65), cv2.FONT_HERSHEY_SIMPLEX, 0.40, ear_status_color, 1)
 
-            # Uyku Ilerleme Cubugu (60 saniye hedefine gore)
+            # Uyku Ilerleme Cubugu
             sleep_prog = min(1.0, sleep_duration / SLEEP_DURATION_REQ_SEC)
             s_bar_w = int((panel_w - 20) * sleep_prog)
             cv2.rectangle(frame, (panel_x + 10, panel_y + 75), (panel_x + panel_w - 10, panel_y + 86), (60, 60, 60), -1)
@@ -535,7 +540,7 @@ def main():
 
             # Ekranda en son kaydedilen videoyu goster
             if last_saved_video_name and not recording_post_event:
-                cv2.putText(frame, f"Son Kayit: {last_saved_video_name}", (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 0), 1)
+                cv2.putText(frame, f"Son Video: {last_saved_video_name}", (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 0), 1)
 
             # Sol ust Durum Bilgisi
             if in_cig_cooldown:
