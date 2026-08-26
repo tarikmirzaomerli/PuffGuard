@@ -24,18 +24,34 @@ os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def speak_text_async(text):
-    """Turkce sesli ikazi arka planda ayri bir thread icinde calistirir (Kamerayi dondurmez)."""
+    """Windows OneCore Turkce (Tolga) dogal ses motoru ile cok net ve anlasilir sesli ikaz verir."""
     def _speak():
         try:
             engine = pyttsx3.init()
-            engine.setProperty('rate', 150) # Dogal konusma hizi
+            engine.setProperty('rate', 160) # Dogal, akici ve anlasilir konusma hizi
 
-            # Turkce ses motoru secimi
-            voices = engine.getProperty('voices')
-            for voice in voices:
-                if 'turkish' in voice.name.lower() or 'tr' in voice.id.lower():
-                    engine.setProperty('voice', voice.id)
+            # 1. Oncelikli: Windows Dogal Turkce Sesleri (Tolga / Emel)
+            onecore_turkish_voices = [
+                r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Speech_OneCore\Voices\Tokens\MSTTS_V110_trTR_Tolga",
+                r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Speech_OneCore\Voices\Tokens\MSTTS_V110_trTR_Emel"
+            ]
+
+            voice_selected = False
+            for v_id in onecore_turkish_voices:
+                try:
+                    engine.setProperty('voice', v_id)
+                    voice_selected = True
                     break
+                except Exception:
+                    pass
+
+            # 2. Alternatif: SAPI5 listesindeki TR sesleri
+            if not voice_selected:
+                voices = engine.getProperty('voices')
+                for voice in voices:
+                    if 'tr' in voice.id.lower() or 'turkish' in voice.name.lower():
+                        engine.setProperty('voice', voice.id)
+                        break
 
             engine.say(text)
             engine.runAndWait()
@@ -240,8 +256,8 @@ def main():
     ) as hands:
 
         print("==================================================")
-        print("PuffGuard - Sesli Ikazli Guvenlik & Takip Sistemi Aktif.")
-        print(f"- Ses Motoru: pyttsx3 (Turkce, 150 WPM)")
+        print("PuffGuard - Dogal Turkce Sesli Ikaz Sistemi Aktif.")
+        print(f"- Ses Motoru: Microsoft Tolga (Windows 10/11 Dogal Turkce)")
         print(f"- Kamera Engelleme: Kağıt, Bez, Bant, Karartma (Hassas Canny Algılama)")
         print(f"- Masadan Ayrılma: Boş oda kenarları algılanır, sessizce beklenir.")
         print(f"- Uyku Tespiti: Kesintisiz {int(SLEEP_DURATION_REQ_SEC)}s (1 Dakika)")
