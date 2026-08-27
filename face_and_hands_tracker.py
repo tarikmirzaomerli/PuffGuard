@@ -1,12 +1,17 @@
 ﻿import os
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "2"
+os.environ["OPENBLAS_NUM_THREADS"] = "2"
+os.environ["MKL_NUM_THREADS"] = "2"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "2"
+os.environ["NUMEXPR_NUM_THREADS"] = "2"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
-import torch
-torch.set_num_threads(1)
-
 import cv2
+cv2.setNumThreads(2)
+
+import torch
+torch.set_num_threads(2)
+
 import mediapipe as mp
 import math
 import time
@@ -121,21 +126,21 @@ def calculate_ear(eye_points, landmarks, width, height):
     return ear
 
 def load_lightweight_onnx_model():
-    """YOLO modelini 640x640 ONNX Runtime formatiyla yukler."""
+    """YOLO modelini 320x320 ONNX Runtime formatiyla yukler."""
     print("==================================================")
-    print("[+] 640x640 ONNX Modeli kontrol ediliyor...")
+    print("[+] 320x320 ONNX Modeli kontrol ediliyor...")
     onnx_path = os.path.join(PROJECT_DIR, "best.onnx")
     pt_path = os.path.join(PROJECT_DIR, "best.pt")
 
     if not os.path.exists(onnx_path) and os.path.exists(pt_path):
-        print("[+] 'best.pt' ONNX formatina donusturuluyor (imgsz=640)...")
+        print("[+] 'best.pt' ONNX formatina donusturuluyor (imgsz=320)...")
         temp_model = YOLO(pt_path)
-        temp_model.export(format="onnx", imgsz=640)
+        temp_model.export(format="onnx", imgsz=320)
         del temp_model
         gc.collect()
 
     if os.path.exists(onnx_path):
-        print(f"[+] 640x640 ONNX Runtime Modeli yukleniyor: '{onnx_path}'")
+        print(f"[+] 320x320 ONNX Runtime Modeli yukleniyor: '{onnx_path}'")
         model = YOLO(onnx_path, task='detect')
         print(f"[+] ONNX Modeli basariyla yuklendi! Siniflar: {model.names}")
         print("==================================================")
@@ -156,7 +161,7 @@ def main():
     else:
         print(f"[+] Kayit klasoru hazir: {photo_dir}")
 
-    # 2. 640x640 ONNX Modelini Yukleme
+    # 2. 320x320 ONNX Modelini Yukleme
     yolo_model = load_lightweight_onnx_model()
 
     # 3. MediaPipe Modulleri
@@ -178,8 +183,8 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-    # --- PARAMETRELER (SIGARA - HASSAS ONNX AYARLARI) ---
-    CONFIDENCE_THRESHOLD = 0.50                # %50 Guven Esigi (Hassas ONNX tespiti)
+    # --- PARAMETRELER (SIGARA - OPTIMIZE ONNX AYARLARI) ---
+    CONFIDENCE_THRESHOLD = 0.50                # %50 Guven Esigi
     REQUIRED_CONSECUTIVE_FRAMES = 12           # 12 Kesintisiz Kare Dogrulamasi
     ALLOWED_CLASSES = {"cigarette"}            # Hedef sinif
     CIGARETTE_NOTIFICATION_COOLDOWN = 900.0    # 15 DAKIKA (900 saniye) Cooldown
@@ -224,6 +229,7 @@ def main():
     last_saved_video_name = ""
 
     frame_counter = 0
+    yolo_frame_counter = 0
     fps_start_time = time.time()
     fps = 0
 
@@ -250,13 +256,13 @@ def main():
     def run_yolo_on_mouth_roi(roi_img, orig_w, orig_h, offset_x, offset_y):
         nonlocal is_yolo_busy, detected_objects, last_seen_time
         try:
-            # 640x640 Yeniden Boyutlandırma ile Yuksek ONNX Hassasiyeti
-            resized_roi = cv2.resize(roi_img, (640, 640))
-            scale_x = orig_w / 640.0
-            scale_y = orig_h / 640.0
+            # CPU OPTIMIZASYONU: 320x320 Boyutlandirma ile Cok Dusuk Islemci Yuku
+            resized_roi = cv2.resize(roi_img, (320, 320))
+            scale_x = orig_w / 320.0
+            scale_y = orig_h / 320.0
 
             with torch.no_grad():
-                results = yolo_model(resized_roi, conf=CONFIDENCE_THRESHOLD, verbose=False, imgsz=640)
+                results = yolo_model(resized_roi, conf=CONFIDENCE_THRESHOLD, verbose=False, imgsz=320)
                 current_boxes = []
 
                 for r in results:
@@ -267,14 +273,14 @@ def main():
 
                         if (cls_name in ALLOWED_CLASSES or cls_id == 0) and conf >= CONFIDENCE_THRESHOLD:
                             bx1, by1, bx2, by2 = map(int, box.xyxy[0])
-                            # 640x640 kutusunu orijinal kirpma koordinatina olcekle
+                            # 320x320 kutusunu orijinal kirpma koordinatina olcekle
                             fx1 = offset_x + int(bx1 * scale_x)
                             fy1 = offset_y + int(by1 * scale_y)
                             fx2 = offset_x + int(bx2 * scale_x)
                             fy2 = offset_y + int(by2 * scale_y)
                             current_boxes.append((fx1, fy1, fx2, fy2, cls_name, conf))
                             last_seen_time = time.time()
-                            print(f"[*] SIGARA YAKALANDI (ONNX): %{int(conf*100)}")
+                            print(f"[*] SIGARA YAKALANDI (320x320 ONNX): %{int(conf*100)}")
 
                 detected_objects = current_boxes
                 del results, resized_roi
@@ -296,14 +302,15 @@ def main():
     ) as hands:
 
         print("==================================================")
-        print("PuffGuard - 640x640 ONNX & 3s Buffer Trigger Aktif.")
-        print(f"- Model: ONNX Runtime 640x640 (conf={int(CONFIDENCE_THRESHOLD*100)}%)")
-        print(f"- Genişletilmiş Tetikleme: El ağza geldikten sonra {int(YOLO_BUFFER_WINDOW_SEC)}s aktif kalır.")
-        print(f"- Dairesel Tampon: 300 Kare JPEG (~25 MB RAM)")
-        print(f"- Ses Motoru: Microsoft Tolga (Doğal Türkçe)")
+        print("PuffGuard - Dusuk CPU (320x320 ONNX + 2-Thread) Aktif.")
+        print(f"- Thread Limiti: 2 CPU Cekirdegi (OMP/MKL/OpenCV/PyTorch)")
+        print(f"- Model: ONNX Runtime 320x320 (Hafif ve Hizli)")
+        print(f"- YOLO Kare Atlama: 3 karede 1 tahmin")
+        print(f"- Genişletilmiş Tetikleme: {int(YOLO_BUFFER_WINDOW_SEC)}s aktif pencere")
+        print(f"- Ses Motoru: Microsoft Tolga (Dogal Turkce)")
         print(f"- Uyku Tespiti: Kesintisiz {int(SLEEP_DURATION_REQ_SEC)}s (1 Dakika)")
         print(f"- Sigara Cooldown: {int(CIGARETTE_NOTIFICATION_COOLDOWN)}s (15 Dakika)")
-        print("- Çıkış: 'q' tuşu")
+        print("- Cikis: 'q' tusu")
         print("==================================================")
 
         while True:
@@ -335,7 +342,7 @@ def main():
                         )
                         speak_text_async("Uyarı! Kamera görüşü engellendi.")
                         last_camera_loss_time = current_time
-                time.sleep(0.1)
+                time.sleep(0.01)
                 continue
             else:
                 camera_loss_start_time = None
@@ -443,7 +450,7 @@ def main():
                 # El Konumu Takibi
                 cached_hand_pos = None
                 if hand_results.multi_hand_landmarks:
-                    for hand_landmarks in hand_results.multi_hand_landmarks:
+                    for hand_landmarks, handedness in zip(hand_results.multi_hand_landmarks, hand_results.multi_handedness):
                         index_tip = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
                         ix, iy = int(index_tip.x * w), int(index_tip.y * h)
                         cached_hand_pos = (ix, iy)
@@ -521,7 +528,7 @@ def main():
             else:
                 sleep_start_time = None
 
-            # --- 4. GENISLETILMIS TETIKLEME (3sn BUFFER) & 640x640 ONNX YOLO ---
+            # --- 4. 320x320 ONNX YOLO & 3 KAREDE 1 TAHMIN (CPU KAZANCI) ---
             is_yolo_active = False
             if lip_center is not None and not is_camera_obstructed:
                 calculated_size = int(eye_distance * 2.2)
@@ -538,13 +545,11 @@ def main():
                 if ry2 - ry1 < roi_size and ry1 > 0:
                     ry1 = max(0, ry2 - roi_size)
 
-                # 1. El ağza yakın mı kontrolü
                 if hand_pos is not None:
                     hand_dist = calculate_distance(hand_pos, lip_center)
                     if hand_dist <= (roi_size * 1.25):
                         last_hand_near_mouth_time = current_time
 
-                # 2. Genişletilmiş Tetikleme Penceresi: El uzaklaşsa bile 3 saniye boyunca YOLO aktif kalır!
                 if (current_time - last_hand_near_mouth_time) <= YOLO_BUFFER_WINDOW_SEC:
                     is_yolo_active = True
 
@@ -552,11 +557,16 @@ def main():
                 cw = rx2 - rx1
                 ch = ry2 - ry1
 
-                # YOLO YALNIZCA TETIKLEME PENCERESINDEYKEN VE AI KARESIYSE CALISIR!
-                if yolo_model is not None and mouth_crop.size > 0 and not is_yolo_busy and process_ai_this_frame and is_yolo_active:
-                    is_yolo_busy = True
-                    threading.Thread(target=run_yolo_on_mouth_roi, args=(mouth_crop.copy(), cw, ch, rx1, ry1), daemon=True).start()
-                elif not is_yolo_active:
+                # CPU OPTIMIZASYONU: Yalnizca her 3 karede 1 YOLO modelini cagir (Arada onceki tespiti koru)
+                if is_yolo_active:
+                    yolo_frame_counter += 1
+                    should_predict_yolo = (yolo_frame_counter % 3 == 0)
+
+                    if yolo_model is not None and mouth_crop.size > 0 and not is_yolo_busy and should_predict_yolo:
+                        is_yolo_busy = True
+                        threading.Thread(target=run_yolo_on_mouth_roi, args=(mouth_crop.copy(), cw, ch, rx1, ry1), daemon=True).start()
+                else:
+                    yolo_frame_counter = 0
                     if (current_time - last_seen_time) > 0.5:
                         detected_objects = []
 
@@ -565,7 +575,7 @@ def main():
                 cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), roi_box_color, 2)
                 
                 remaining_buf = max(0.0, YOLO_BUFFER_WINDOW_SEC - (current_time - last_hand_near_mouth_time))
-                roi_label = f"ONNX ROI {roi_size}x{roi_size}" + (f" [YOLO AKTIF {remaining_buf:.1f}s]" if is_yolo_active else " [BEKLEMEDE]")
+                roi_label = f"ONNX 320x320" + (f" [YOLO AKTIF {remaining_buf:.1f}s]" if is_yolo_active else " [BEKLEMEDE]")
                 cv2.putText(frame, roi_label, (rx1, max(15, ry1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.40, roi_box_color, 1)
 
             # 5. Sigara Dogrulama Sayaci (12 Kare)
@@ -669,6 +679,9 @@ def main():
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
+
+            # CPU UYKUSU & FPS SABITLEME (Islemcinin nefes almasi saglanir)
+            time.sleep(0.01)
 
     cap.release()
     cv2.destroyAllWindows()
