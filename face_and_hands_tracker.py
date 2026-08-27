@@ -14,12 +14,12 @@ torch.set_num_threads(2)
 
 import psutil
 try:
-    # Surecin CPU onceligini Normalin Altina (BELOW_NORMAL) cekerek bilgisayarin donmasini onle
     p = psutil.Process()
     p.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
 except Exception:
     pass
 
+import multiprocessing as mproc
 import mediapipe as mp
 import math
 import time
@@ -90,7 +90,7 @@ def send_desktop_notification(title, message):
 
     threading.Thread(target=_notify, daemon=True).start()
 
-def save_compressed_video_async(compressed_frames_list, video_path, width=480, height=360, fps=30.0, event_name="VIDEO"):
+def save_compressed_video_async(compressed_frames_list, video_path, width=640, height=480, fps=30.0, event_name="VIDEO"):
     """Sikistirilmis JPEG tamponunu decode edip MP4 yazar ve RAM'i tamamen serbest birakir."""
     def _save():
         try:
@@ -107,8 +107,6 @@ def save_compressed_video_async(compressed_frames_list, video_path, width=480, h
         finally:
             del compressed_frames_list
             gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
     threading.Thread(target=_save, daemon=True).start()
 
@@ -133,32 +131,57 @@ def calculate_ear(eye_points, landmarks, width, height):
     ear = (v1 + v2) / (2.0 * h)
     return ear
 
-def load_lightweight_onnx_model():
-    """YOLO modelini 256x256 ONNX Runtime formatiyla yukler."""
-    print("==================================================")
-    print("[+] 256x256 ONNX Modeli kontrol ediliyor...")
-    onnx_path = os.path.join(PROJECT_DIR, "best.onnx")
-    pt_path = os.path.join(PROJECT_DIR, "best.pt")
+def yolo_multiprocess_worker(input_queue, output_queue, model_path, confidence_threshold=0.50):
+    """Bagimsiz arka plan islemi: Ana surecten tamamen ayri calisir ve CPU yu kitlemez."""
+    try:
+        # Surec ici thread kısıtlamaları
+        os.environ["OMP_NUM_THREADS"] = "1"
+        os.environ["MKL_NUM_THREADS"] = "1"
+        torch.set_num_threads(1)
 
-    if not os.path.exists(onnx_path) and os.path.exists(pt_path):
-        print("[+] 'best.pt' ONNX formatina donusturuluyor (imgsz=256)...")
-        temp_model = YOLO(pt_path)
-        temp_model.export(format="onnx", imgsz=256)
-        del temp_model
-        gc.collect()
+        print(f"[Worker] YOLO arka plan sureci baslatildi. Model: {model_path}")
+        yolo_model = YOLO(model_path, task="detect")
+        allowed_classes = {"cigarette"}
 
-    if os.path.exists(onnx_path):
-        print(f"[+] 256x256 ONNX Runtime Modeli yukleniyor: '{onnx_path}'")
-        model = YOLO(onnx_path, task='detect')
-        print(f"[+] ONNX Modeli basariyla yuklendi! Siniflar: {model.names}")
-        print("==================================================")
-        return model
-    elif os.path.exists(pt_path):
-        print(f"[!] ONNX bulunamadi, 'best.pt' yukleniyor...")
-        return YOLO(pt_path)
-    else:
-        print("[!] Model dosyasi bulunamadi!")
-        return None
+        while True:
+            item = input_queue.get()
+            if item is None:
+                break
+
+            roi_img, orig_w, orig_h, offset_x, offset_y = item
+
+            try:
+                resized_roi = cv2.resize(roi_img, (320, 320))
+                scale_x = orig_w / 320.0
+                scale_y = orig_h / 320.0
+
+                with torch.no_grad():
+                    results = yolo_model(resized_roi, conf=confidence_threshold, verbose=False, imgsz=320)
+                    boxes_out = []
+
+                    for r in results:
+                        for box in r.boxes:
+                            conf = float(box.conf[0])
+                            cls_id = int(box.cls[0])
+                            cls_name = r.names[cls_id].strip().lower() if (hasattr(r, 'names') and cls_id in r.names) else "cigarette"
+
+                            if (cls_name in allowed_classes or cls_id == 0) and conf >= confidence_threshold:
+                                bx1, by1, bx2, by2 = map(int, box.xyxy[0])
+                                fx1 = offset_x + int(bx1 * scale_x)
+                                fy1 = offset_y + int(by1 * scale_y)
+                                fx2 = offset_x + int(bx2 * scale_x)
+                                fy2 = offset_y + int(by2 * scale_y)
+                                boxes_out.append((fx1, fy1, fx2, fy2, cls_name, conf))
+
+                    output_queue.put(boxes_out)
+                    del results, resized_roi
+            except Exception as e:
+                output_queue.put([])
+            finally:
+                del roi_img
+
+    except Exception as e:
+        print(f"[Worker] Hata: {e}")
 
 def main():
     # 1. Proje Icindeki 'cigarettes-foto' Klasorunu Olustur
@@ -169,15 +192,28 @@ def main():
     else:
         print(f"[+] Kayit klasoru hazir: {photo_dir}")
 
-    # 2. 256x256 ONNX Modelini Yukleme
-    yolo_model = load_lightweight_onnx_model()
+    # 2. Model Dosyasi Kontrolu
+    onnx_path = os.path.join(PROJECT_DIR, "best.onnx")
+    pt_path = os.path.join(PROJECT_DIR, "best.pt")
+    model_to_use = onnx_path if os.path.exists(onnx_path) else pt_path
 
-    # 3. MediaPipe Modulleri (max_num_faces=1, refine_landmarks=False)
+    # 3. YOLO Bagimsiz Sureci (Multiprocessing) Baslatma
+    yolo_in_queue = mproc.Queue(maxsize=1)
+    yolo_out_queue = mproc.Queue(maxsize=1)
+    worker_proc = mproc.Process(
+        target=yolo_multiprocess_worker,
+        args=(yolo_in_queue, yolo_out_queue, model_to_use, 0.50),
+        daemon=True
+    )
+    worker_proc.start()
+
+    # 4. MediaPipe Modulleri
     mp_face_mesh = mp.solutions.face_mesh
     mp_hands = mp.solutions.hands
     mp_drawing = mp.solutions.drawing_utils
     mp_drawing_styles = mp.solutions.drawing_styles
 
+    # 5. Giris Cozunurlugunu Donanimda 640x480 Olarak Sabitle
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("Hata: Kamera acilamadi!")
@@ -187,17 +223,11 @@ def main():
         )
         return
 
-    # Kamera cozunurlugunu 640x480 olarak ayarla
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-    # Analiz ve goruntu cozunurlugu: 480x360 (CPU Tasarrufu)
-    PROC_W, PROC_H = 480, 360
-
-    # --- PARAMETRELER (SIGARA - OPTIMIZE ONNX AYARLARI) ---
-    CONFIDENCE_THRESHOLD = 0.50                # %50 Guven Esigi
+    # --- PARAMETRELER (SIGARA) ---
     REQUIRED_CONSECUTIVE_FRAMES = 12           # 12 Kesintisiz Kare Dogrulamasi
-    ALLOWED_CLASSES = {"cigarette"}            # Hedef sinif
     CIGARETTE_NOTIFICATION_COOLDOWN = 900.0    # 15 DAKIKA (900 saniye) Cooldown
     YOLO_BUFFER_WINDOW_SEC = 3.0               # El uzaklassa bile 3 saniye tetikte kal
 
@@ -214,9 +244,10 @@ def main():
     BLOCK_DURATION_REQ_SEC = 60.0              # Kesintisiz 1 DAKIKA (60 saniye)
     SECURITY_NOTIFICATION_COOLDOWN = 120.0     # 2 DAKIKA (120 saniye) Cooldown
     BRIGHTNESS_OBSTRUCTION_THRESHOLD = 22.0    # Parlaklik < 22 ise karartma/el
-    EDGE_COUNT_THRESHOLD = 120                 # Canny kenar sayisi
+    EDGE_COUNT_THRESHOLD = 150                 # Canny kenar sayisi
 
-    # JPEG SIKISTIRILMIS 300 KARELIK TAMPON
+    # JPEG SIKISTIRILMIS 300 KARELIK TAMPON (RAM SADECE ~25 MB)
+    BUFFER_W, BUFFER_H = 640, 480
     frame_buffer = deque(maxlen=300)
 
     # Sigara 5sn Oncesi + 5sn Sonrasi Kayit Degiskenleri
@@ -239,19 +270,17 @@ def main():
     last_saved_video_name = ""
 
     frame_counter = 0
-    yolo_frame_counter = 0
     fps_start_time = time.time()
     fps = 0
 
-    # Thread / Asenkron degiskenler
-    is_yolo_busy = False
+    # Tespit nesneleri
     detected_objects = []
     last_seen_time = 0.0
 
-    # 4 Karede 1 MediaPipe onbellek degiskenleri
+    # 5 Karede 1 MediaPipe Onbellek Degiskenleri
     cached_has_face = False
     cached_lip_center = None
-    cached_eye_distance = 60.0
+    cached_eye_distance = 80.0
     cached_avg_ear = 0.35
     cached_eyes_closed = False
     cached_is_obstructed = False
@@ -262,43 +291,6 @@ def main():
     for conn in mp_face_mesh.FACEMESH_LIPS:
         lip_indices.add(conn[0])
         lip_indices.add(conn[1])
-
-    def run_yolo_on_mouth_roi(roi_img, orig_w, orig_h, offset_x, offset_y):
-        nonlocal is_yolo_busy, detected_objects, last_seen_time
-        try:
-            # 256x256 Boyutlandirma ile Cok Dusuk Islemci Yuku
-            resized_roi = cv2.resize(roi_img, (256, 256))
-            scale_x = orig_w / 256.0
-            scale_y = orig_h / 256.0
-
-            with torch.no_grad():
-                results = yolo_model(resized_roi, conf=CONFIDENCE_THRESHOLD, verbose=False, imgsz=256)
-                current_boxes = []
-
-                for r in results:
-                    for box in r.boxes:
-                        conf = float(box.conf[0])
-                        cls_id = int(box.cls[0])
-                        cls_name = r.names[cls_id].strip().lower() if (hasattr(r, 'names') and cls_id in r.names) else "cigarette"
-
-                        if (cls_name in ALLOWED_CLASSES or cls_id == 0) and conf >= CONFIDENCE_THRESHOLD:
-                            bx1, by1, bx2, by2 = map(int, box.xyxy[0])
-                            # 256x256 kutusunu orijinal kirpma koordinatina olcekle
-                            fx1 = offset_x + int(bx1 * scale_x)
-                            fy1 = offset_y + int(by1 * scale_y)
-                            fx2 = offset_x + int(bx2 * scale_x)
-                            fy2 = offset_y + int(by2 * scale_y)
-                            current_boxes.append((fx1, fy1, fx2, fy2, cls_name, conf))
-                            last_seen_time = time.time()
-                            print(f"[*] SIGARA YAKALANDI (256x256 ONNX): %{int(conf*100)}")
-
-                detected_objects = current_boxes
-                del results, resized_roi
-        except Exception as e:
-            pass
-        finally:
-            del roi_img
-            is_yolo_busy = False
 
     with mp_face_mesh.FaceMesh(
         max_num_faces=1,
@@ -312,11 +304,11 @@ def main():
     ) as hands:
 
         print("==================================================")
-        print("PuffGuard - Ultra Dusuk CPU & 480x360 Pipeline Aktif.")
-        print(f"- Process Priority: BELOW_NORMAL (Sistem Donmasini Onler)")
-        print(f"- Analiz Boyutu: 480x360 (MediaPipe & YOLO)")
-        print(f"- Göz Taraması: 4 Karede 1 Kez")
-        print(f"- YOLO Tahmini: 256x256 ONNX (5 Karede 1 Kez)")
+        print("PuffGuard - Multiprocessing & 640x480 Dusuk CPU Mimarisi.")
+        print(f"- YOLO Modu: Ayri Surec (Multiprocessing Process)")
+        print(f"- Kamera Donanim Cozunurlugu: 640x480")
+        print(f"- Goz Taramasi: Her 5 Karede 1 Kez (Saniyede ~6 Kez)")
+        print(f"- CPU Uykusu: 20ms Dinlenme (time.sleep(0.02))")
         print(f"- Ses Motoru: Microsoft Tolga (Dogal Turkce)")
         print(f"- Uyku Tespiti: Kesintisiz {int(SLEEP_DURATION_REQ_SEC)}s (1 Dakika)")
         print(f"- Sigara Cooldown: {int(CIGARETTE_NOTIFICATION_COOLDOWN)}s (15 Dakika)")
@@ -326,13 +318,13 @@ def main():
         while True:
             current_time = time.time()
             frame_counter += 1
-            # 4 KAREDE 1 MEDIAPIPE ANALIZI
-            process_ai_this_frame = (frame_counter % 4 == 0)
+            # 5 KAREDE 1 MEDIAPIPE ANALIZI (%80 CPU Tasarrufu)
+            process_ai_this_frame = (frame_counter % 5 == 0)
 
-            success, raw_frame = cap.read()
+            success, frame = cap.read()
 
             # --- 1. DONANIM / YAZILIM KAPANMASI ---
-            if not success or raw_frame is None:
+            if not success or frame is None:
                 if camera_loss_start_time is None:
                     camera_loss_start_time = current_time
                 loss_duration = current_time - camera_loss_start_time
@@ -353,14 +345,13 @@ def main():
                         )
                         speak_text_async("Uyarı! Kamera görüşü engellendi.")
                         last_camera_loss_time = current_time
-                time.sleep(0.01)
+                time.sleep(0.02)
                 continue
             else:
                 camera_loss_start_time = None
 
-            # CPU OPTIMIZASYONU: Analiz icin 480x360 boyutuna kucult
-            frame = cv2.resize(cv2.flip(raw_frame, 1), (PROC_W, PROC_H))
             last_valid_frame = frame
+            frame = cv2.flip(frame, 1)
             h, w, _ = frame.shape
 
             # Sıkıştırılmış JPEG Tampon
@@ -374,7 +365,7 @@ def main():
                     video_name = f"cigarette_video_10s_{event_timestamp_str}.mp4"
                     video_path = os.path.join(photo_dir, video_name)
 
-                    save_compressed_video_async(list(frame_buffer), video_path, width=PROC_W, height=PROC_H, fps=30.0, event_name="10s SIGARA VIDEOSU")
+                    save_compressed_video_async(list(frame_buffer), video_path, width=BUFFER_W, height=BUFFER_H, fps=30.0, event_name="10s SIGARA VIDEOSU")
                     last_saved_video_name = video_name
 
                     send_desktop_notification(
@@ -394,7 +385,7 @@ def main():
                 fps_start_time = time.time()
                 gc.collect()
 
-            # --- 4 KAREDE 1 KEZ MEDIAPIPE ANALIZI ---
+            # --- 5 KAREDE 1 KEZ MEDIAPIPE ANALIZI ---
             if process_ai_this_frame:
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 rgb_frame.flags.writeable = False
@@ -464,7 +455,7 @@ def main():
                         index_tip = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
                         ix, iy = int(index_tip.x * w), int(index_tip.y * h)
                         cached_hand_pos = (ix, iy)
-                        cv2.circle(frame, (ix, iy), 5, (0, 255, 0), cv2.FILLED)
+                        cv2.circle(frame, (ix, iy), 6, (0, 255, 0), cv2.FILLED)
 
                 del face_results, hand_results, rgb_frame
 
@@ -500,8 +491,8 @@ def main():
                         speak_text_async("Uyarı! Kamera görüşü engellendi.")
                         last_blocked_notification_time = current_time
 
-                cv2.rectangle(frame, (10, h // 2 - 35), (w - 10, h // 2 + 35), (0, 0, 180), -1)
-                cv2.putText(frame, f"UYARI: KAMERA ONU ENGELLENDI {block_duration:.1f}s / {int(BLOCK_DURATION_REQ_SEC)}s", (15, h // 2 + 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 2)
+                cv2.rectangle(frame, (20, h // 2 - 40), (w - 20, h // 2 + 40), (0, 0, 180), -1)
+                cv2.putText(frame, f"UYARI: KAMERA ONU ENGELLENDI ({block_reason}) {block_duration:.1f}s / {int(BLOCK_DURATION_REQ_SEC)}s", (20, h // 2 + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 2)
             else:
                 block_start_time = None
 
@@ -517,15 +508,15 @@ def main():
                 sleep_duration = current_time - sleep_start_time
 
                 if sleep_duration >= SLEEP_DURATION_REQ_SEC:
-                    cv2.rectangle(frame, (10, h - 80), (w - 10, h - 45), (0, 0, 220), -1)
-                    cv2.putText(frame, "UYARI: 1 DAKIKADIR UYKU HALINDESINIZ!", (20, h - 57), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2)
+                    cv2.rectangle(frame, (20, h - 100), (w - 20, h - 55), (0, 0, 220), -1)
+                    cv2.putText(frame, "UYARI: 1 DAKIKADIR UYKU HALINDESINIZ!", (35, h - 70), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
 
                     if not in_sleep_cooldown:
                         now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
                         sleep_video_name = f"sleep_alert_{now_str}.mp4"
                         sleep_video_path = os.path.join(photo_dir, sleep_video_name)
 
-                        save_compressed_video_async(list(frame_buffer), sleep_video_path, width=PROC_W, height=PROC_H, fps=30.0, event_name="1 DAKIKALIK UYKU VIDEOSU")
+                        save_compressed_video_async(list(frame_buffer), sleep_video_path, width=BUFFER_W, height=BUFFER_H, fps=30.0, event_name="1 DAKIKALIK UYKU VIDEOSU")
                         last_saved_video_name = sleep_video_name
 
                         send_desktop_notification(
@@ -538,11 +529,11 @@ def main():
             else:
                 sleep_start_time = None
 
-            # --- 4. 256x256 ONNX YOLO & HER 5 KAREDE 1 TAHMIN ---
+            # --- 4. MULTIPROCESSING TETIKLEMELI YOLO HABERLESMESI ---
             is_yolo_active = False
             if lip_center is not None and not is_camera_obstructed:
                 calculated_size = int(eye_distance * 2.2)
-                roi_size = max(110, calculated_size)
+                roi_size = max(150, calculated_size)
                 half_sz = roi_size // 2
 
                 rx1 = max(0, lip_center[0] - half_sz)
@@ -567,16 +558,20 @@ def main():
                 cw = rx2 - rx1
                 ch = ry2 - ry1
 
-                # CPU OPTIMIZASYONU: Yalnizca her 5 karede 1 ONNX 256x256 cagir
-                if is_yolo_active:
-                    yolo_frame_counter += 1
-                    should_predict_yolo = (yolo_frame_counter % 5 == 0)
+                # Yalnizca el yakininda / tetikte iken kuyruga kare gonder (Bloklamaz)
+                if is_yolo_active and mouth_crop.size > 0 and yolo_in_queue.empty():
+                    yolo_in_queue.put((mouth_crop.copy(), cw, ch, rx1, ry1))
 
-                    if yolo_model is not None and mouth_crop.size > 0 and not is_yolo_busy and should_predict_yolo:
-                        is_yolo_busy = True
-                        threading.Thread(target=run_yolo_on_mouth_roi, args=(mouth_crop.copy(), cw, ch, rx1, ry1), daemon=True).start()
-                else:
-                    yolo_frame_counter = 0
+                # Arka plandaki YOLO surecinden gelen sonucu oku (Bloklamaz)
+                try:
+                    res_boxes = yolo_out_queue.get_nowait()
+                    detected_objects = res_boxes
+                    if len(detected_objects) > 0:
+                        last_seen_time = time.time()
+                except Exception:
+                    pass
+
+                if not is_yolo_active:
                     if (current_time - last_seen_time) > 0.5:
                         detected_objects = []
 
@@ -585,8 +580,8 @@ def main():
                 cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), roi_box_color, 2)
                 
                 remaining_buf = max(0.0, YOLO_BUFFER_WINDOW_SEC - (current_time - last_hand_near_mouth_time))
-                roi_label = f"ONNX 256x256" + (f" [YOLO {remaining_buf:.1f}s]" if is_yolo_active else " [BEKLEMEDE]")
-                cv2.putText(frame, roi_label, (rx1, max(12, ry1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.35, roi_box_color, 1)
+                roi_label = f"ONNX MultiProc" + (f" [YOLO {remaining_buf:.1f}s]" if is_yolo_active else " [BEKLEMEDE]")
+                cv2.putText(frame, roi_label, (rx1, max(15, ry1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.40, roi_box_color, 1)
 
             # 5. Sigara Dogrulama Sayaci (12 Kare)
             is_currently_detected = len(detected_objects) > 0 or (current_time - last_seen_time < 0.45)
@@ -599,10 +594,10 @@ def main():
                         best_score = conf
 
                     display_text = f"SIGARA %{int(conf*100)}"
-                    cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), (0, 0, 255), 2)
-                    (tw, th), _ = cv2.getTextSize(display_text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-                    cv2.rectangle(frame, (fx1, max(0, fy1 - 18)), (fx1 + tw + 6, max(18, fy1)), (0, 0, 255), -1)
-                    cv2.putText(frame, display_text, (fx1 + 3, max(14, fy1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+                    cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), (0, 0, 255), 3)
+                    (tw, th), _ = cv2.getTextSize(display_text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+                    cv2.rectangle(frame, (fx1, max(0, fy1 - 22)), (fx1 + tw + 8, max(22, fy1)), (0, 0, 255), -1)
+                    cv2.putText(frame, display_text, (fx1 + 4, max(16, fy1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
             else:
                 consecutive_detection_count = 0
 
@@ -619,12 +614,12 @@ def main():
                     print(f"\n[+] SIGARA DOGRULANDI! 5 saniyelik sonrasi kaydediliyor...")
                     speak_text_async("Sigara kullanımı tespit edildi. Kayıt alınıyor.")
 
-                cv2.putText(frame, f"DOGRULANDI: SIGARA (%{int(best_score*100)})", (w // 2 - 160, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
+                cv2.putText(frame, f"DOGRULANDI: SIGARA (%{int(best_score*100)})", (w // 2 - 210, h - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-            # Sag ust Bilgi Paneli (480x360 ekrana gore olceklendi)
-            panel_w, panel_h = 260, 95
-            panel_x = w - panel_w - 8
-            panel_y = 8
+            # Sag ust Bilgi Paneli
+            panel_w, panel_h = 320, 115
+            panel_x = w - panel_w - 10
+            panel_y = 10
 
             overlay = frame.copy()
             bg_col = (0, 0, 200) if (is_cig_confirmed or sleep_duration >= SLEEP_DURATION_REQ_SEC) else (40, 40, 40)
@@ -632,37 +627,37 @@ def main():
             cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
             cv2.rectangle(frame, (panel_x, panel_y), (panel_x + panel_w, panel_y + panel_h), (255, 255, 255), 1)
 
-            cv2.putText(frame, "PUFFGUARD TAKIP PANELI", (panel_x + 8, panel_y + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1)
+            cv2.putText(frame, "PUFFGUARD TAKIP PANELI", (panel_x + 10, panel_y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1)
             
             counter_str = f"Sigara: {consecutive_detection_count}/{REQUIRED_CONSECUTIVE_FRAMES}" + (" (15dk Bekleme)" if in_cig_cooldown else " (Hazir)")
-            cv2.putText(frame, counter_str, (panel_x + 8, panel_y + 34), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (255, 255, 255), 1)
+            cv2.putText(frame, counter_str, (panel_x + 10, panel_y + 42), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 255, 255), 1)
 
             ear_status_color = (0, 0, 255) if eyes_closed else (0, 255, 0)
             ear_str = f"Goz (EAR): {avg_ear:.2f} | Kapali: {sleep_duration:.1f}s / {int(SLEEP_DURATION_REQ_SEC)}s"
-            cv2.putText(frame, ear_str, (panel_x + 8, panel_y + 53), cv2.FONT_HERSHEY_SIMPLEX, 0.34, ear_status_color, 1)
+            cv2.putText(frame, ear_str, (panel_x + 10, panel_y + 65), cv2.FONT_HERSHEY_SIMPLEX, 0.40, ear_status_color, 1)
 
             sleep_prog = min(1.0, sleep_duration / SLEEP_DURATION_REQ_SEC)
-            s_bar_w = int((panel_w - 16) * sleep_prog)
-            cv2.rectangle(frame, (panel_x + 8, panel_y + 61), (panel_x + panel_w - 8, panel_y + 70), (60, 60, 60), -1)
-            cv2.rectangle(frame, (panel_x + 8, panel_y + 61), (panel_x + 8 + s_bar_w, panel_y + 70), (0, 165, 255), -1)
+            s_bar_w = int((panel_w - 20) * sleep_prog)
+            cv2.rectangle(frame, (panel_x + 10, panel_y + 75), (panel_x + panel_w - 10, panel_y + 86), (60, 60, 60), -1)
+            cv2.rectangle(frame, (panel_x + 10, panel_y + 75), (panel_x + 10 + s_bar_w, panel_y + 86), (0, 165, 255), -1)
 
             sleep_cd_text = f"Uyku CD: {int(sleep_cooldown_remaining)}s" if in_sleep_cooldown else "Uyku Modu: Aktif (1dk)"
-            cv2.putText(frame, sleep_cd_text, (panel_x + 8, panel_y + 85), cv2.FONT_HERSHEY_SIMPLEX, 0.32, (200, 200, 200), 1)
+            cv2.putText(frame, sleep_cd_text, (panel_x + 10, panel_y + 103), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1)
 
             if recording_post_event:
                 rec_progress = int((post_event_counter / POST_EVENT_FRAMES_REQUIRED) * 100)
-                cv2.rectangle(frame, (8, h - 50), (260, h - 18), (0, 0, 180), -1)
-                cv2.putText(frame, f"KAYDEDILIYOR (+5sn): %{rec_progress}", (15, h - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+                cv2.rectangle(frame, (10, h - 60), (320, h - 20), (0, 0, 180), -1)
+                cv2.putText(frame, f"KAYDEDILIYOR (+5sn): %{rec_progress}", (20, h - 35), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
 
             if last_saved_video_name and not recording_post_event:
-                cv2.putText(frame, f"Son Video: {last_saved_video_name}", (8, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 0), 1)
+                cv2.putText(frame, f"Son Video: {last_saved_video_name}", (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 0), 1)
 
             if in_cig_cooldown:
                 mins = int(cig_cooldown_remaining // 60)
                 secs = int(cig_cooldown_remaining % 60)
-                cd_str = f" | 15dk CD: {mins}d {secs:02d}s"
+                cd_str = f" | Sigara 15dk CD: {mins}d {secs:02d}s"
             elif recording_post_event:
-                cd_str = f" | Kaydediliyor ({post_event_counter}/150)"
+                cd_str = f" | Video Hazirlaniyor ({post_event_counter}/150)"
             else:
                 cd_str = " | Sigara: Hazir"
 
@@ -670,7 +665,7 @@ def main():
                 system_status_tag = "KAMERA ENGELLENDI!"
                 system_status_color = (0, 0, 255)
             elif not has_face:
-                system_status_tag = "MASADAN AYRILDI"
+                system_status_tag = "MASADAN AYRILDI (BEKLEMEDE)"
                 system_status_color = (255, 200, 0)
             elif sleep_duration >= SLEEP_DURATION_REQ_SEC:
                 system_status_tag = "1DK UYKU ALARMI!"
@@ -683,14 +678,22 @@ def main():
                 system_status_color = (0, 255, 0)
 
             status_text = f"FPS: {fps} | {system_status_tag}{cd_str}"
-            cv2.putText(frame, status_text, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.36, system_status_color, 1)
+            cv2.putText(frame, status_text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.40, system_status_color, 1)
 
             cv2.imshow("PuffGuard - Sigara & Uyku Takip Sistemi", frame)
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
-            time.sleep(0.01)
+            # 20ms CPU Uykusu (Islemciyi %10-25 seviyesinde rahatlatir)
+            time.sleep(0.02)
+
+    # Temizlik ve Worker Kapatma
+    try:
+        yolo_in_queue.put(None)
+        worker_proc.join(timeout=1)
+    except Exception:
+        pass
 
     cap.release()
     cv2.destroyAllWindows()
